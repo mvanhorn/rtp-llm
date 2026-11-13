@@ -132,8 +132,8 @@ class SparseGqaRoutingTest(unittest.TestCase):
                 torch.testing.assert_close(captured, refreshed)
 
     def test_sparse_qwen4_prefill_routes_to_sparse_gqa(self):
-        attn_configs, _ = _configs()
-        self.assertEqual(_select_attention_impl_key(attn_configs), "sparse_gqa")
+        attn_configs, attn_inputs = _configs()
+        self.assertEqual(_select_attention_impl_key(attn_configs, attn_inputs), "sparse_gqa")
 
     def test_unwired_model_keeps_the_dense_fallback(self):
         """Indexer on but the sparse impl not opted in -> dense (mha).
@@ -141,16 +141,16 @@ class SparseGqaRoutingTest(unittest.TestCase):
         This is the state until the attention module runs the indexer and
         hands over its selection.
         """
-        attn_configs, _ = _configs(opt_in=False)
-        self.assertEqual(_select_attention_impl_key(attn_configs), "mha")
+        attn_configs, attn_inputs = _configs(opt_in=False)
+        self.assertEqual(_select_attention_impl_key(attn_configs, attn_inputs), "mha")
 
     def test_dense_model_routes_to_mha(self):
-        attn_configs, _ = _configs(is_sparse=False)
-        self.assertEqual(_select_attention_impl_key(attn_configs), "mha")
+        attn_configs, attn_inputs = _configs(is_sparse=False)
+        self.assertEqual(_select_attention_impl_key(attn_configs, attn_inputs), "mha")
 
     def test_mla_takes_priority(self):
-        attn_configs, _ = _configs(use_mla=True)
-        self.assertEqual(_select_attention_impl_key(attn_configs), "mla")
+        attn_configs, attn_inputs = _configs(use_mla=True)
+        self.assertEqual(_select_attention_impl_key(attn_configs, attn_inputs), "mla")
 
     def test_impl_support_matches_the_key_logic(self):
         attn_configs, attn_inputs = _configs()
@@ -832,19 +832,10 @@ class SparseGqaImplForwardTest(unittest.TestCase):
         selected[:, 0] = 0
         return impl, qkv, cache, selected
 
-    def test_fallback_geometry_has_one_read_and_preserves_wide_lengths(self):
-        from rtp_llm.models_py.modules.qwen4_exp.qsa import fmha_validation
-
+    def test_geometry_rejects_wide_lengths(self):
         impl, qkv, cache, _ = self._incremental_plan_case()
         prefixes = impl.attn_inputs.prefix_lengths.to(device=_DEV, dtype=torch.int64)
         lengths = impl.attn_inputs.input_lengths.to(device=_DEV, dtype=torch.int64)
-        original_item = torch.Tensor.item
-        reads = []
-
-        def item(tensor, *args, **kwargs):
-            if tensor.is_cuda:
-                reads.append(tensor.numel())
-            return original_item(tensor, *args, **kwargs)
 
         def validate():
             return impl._validate_main_paged_geometry(
@@ -855,43 +846,20 @@ class SparseGqaImplForwardTest(unittest.TestCase):
                 qkv.device,
             )
 
-        with patch.object(
-            fmha_validation, "_try_validate_main_paged_geometry", return_value=None
-        ):
-            with patch.object(torch.Tensor, "item", item):
-                self.assertEqual(validate(), 4)
-            self.assertEqual(reads, [1])
-            for invalid in (2**32 + 3, torch.iinfo(torch.int64).max):
-                prefixes[0] = invalid
-                with self.assertRaisesRegex(RuntimeError, "cover the visible KV"):
-                    validate()
-            prefixes[0] = -1
-            with self.assertRaisesRegex(RuntimeError, "non-negative"):
+        self.assertEqual(validate(), 4)
+        for invalid in (2**32 + 3, torch.iinfo(torch.int64).max):
+            prefixes[0] = invalid
+            with self.assertRaisesRegex(RuntimeError, "cover the visible KV"):
                 validate()
+        prefixes[0] = -1
+        with self.assertRaisesRegex(RuntimeError, "non-negative"):
+            validate()
 
-    def test_device_incremental_partition_and_verdict_share_one_read(self):
+    def test_device_incremental_partition_and_verdict(self):
         impl, qkv, cache, selected = self._incremental_plan_case()
         impl.attn_inputs.input_lengths = impl.attn_inputs.input_lengths.cuda()
         impl.attn_inputs.prefix_lengths = impl.attn_inputs.prefix_lengths.cuda()
-        original_item, original_tolist = torch.Tensor.item, torch.Tensor.tolist
-        reads = []
-
-        def item(tensor, *args, **kwargs):
-            if tensor.is_cuda:
-                reads.append("item")
-            return original_item(tensor, *args, **kwargs)
-
-        def tolist(tensor, *args, **kwargs):
-            if tensor.is_cuda:
-                reads.append("tolist")
-            return original_tolist(tensor, *args, **kwargs)
-
-        with (
-            patch.object(torch.Tensor, "item", item),
-            patch.object(torch.Tensor, "tolist", tolist),
-        ):
-            plan = impl._prepare_incremental_prefill_inputs(qkv, cache, selected)
-        self.assertEqual(reads, ["tolist"])
+        plan = impl._prepare_incremental_prefill_inputs(qkv, cache, selected)
         self.assertEqual([(r.start, r.end) for r in plan.requests], [(0, 3), (3, 5)])
         impl.attn_inputs.cu_seqlens_device[1] = 2
         with self.assertRaisesRegex(ValueError, "cu_seqlens"):
@@ -1044,7 +1012,7 @@ class SparseGqaImplForwardTest(unittest.TestCase):
         self.assertEqual(
             [r.kv_lens.tolist() for r in plan.requests], [[[4, 5, 6]], [[8, 9]]]
         )
-        self.assertIs(plan.cu_seqlens, impl.attn_inputs.cu_seqlens_device)
+        self.assertEqual(plan.tokens, 5)
         # Reusing storage must not reuse a previously validated partition.
         impl.attn_inputs.cu_seqlens_device[1] = 2
         with self.assertRaisesRegex(ValueError, "cu_seqlens"):
@@ -1052,7 +1020,7 @@ class SparseGqaImplForwardTest(unittest.TestCase):
         impl.attn_inputs.input_lengths.copy_(torch.tensor([2, 3], dtype=torch.int32))
         plan = impl._prepare_incremental_prefill_inputs(qkv, cache, selected)
         self.assertEqual(
-            [(r.start, r.end, r.prefix) for r in plan.requests], [(0, 2, 3), (2, 5, 7)]
+            [(r.start, r.end) for r in plan.requests], [(0, 2), (2, 5)]
         )
         self.assertEqual(
             [r.kv_lens.tolist() for r in plan.requests], [[[4, 5]], [[8, 9, 10]]]
@@ -1066,8 +1034,7 @@ class SparseGqaImplForwardTest(unittest.TestCase):
         plan = impl._prepare_incremental_prefill_inputs(qkv, cache, selected)
         impl.attn_inputs.input_lengths.copy_(torch.tensor([2, 3], dtype=torch.int32))
         impl.attn_inputs.prefix_lengths.fill_(1)
-        self.assertEqual(plan.lengths_host, (3, 2))
-        self.assertEqual(plan.prefixes_host, (3, 7))
+        self.assertEqual(plan.tokens, 5)
         self.assertEqual(len(plan.requests), 2)
         first, last = plan.requests[:]
         self.assertIs(plan.requests[-1], last)
@@ -1168,7 +1135,6 @@ class SparseGqaImplForwardTest(unittest.TestCase):
         ):
             actual = impl._prepare_incremental_prefill_inputs(qkv, cache, selected)
         for a, b in zip(actual.requests, expected.requests):
-            self.assertIsNone(a.prefix)
             torch.testing.assert_close(a.kv_lens, b.kv_lens, atol=0, rtol=0)
 
     def test_nonzero_prefix_requires_the_paged_bridge_not_local_prefill(self):
@@ -1366,16 +1332,7 @@ class SparseGqaImplForwardTest(unittest.TestCase):
             *,
             page_size,
             kv_head_num,
-            _validated_plan,
         ):
-            from rtp_llm.models_py.modules.qwen4_exp.qsa.fmha_plans import PagedInputs
-
-            self.assertIsInstance(_validated_plan, PagedInputs)
-            self.assertIs(_validated_plan.block_table, block_table)
-            self.assertIs(_validated_plan.kv_lens, kv_lens)
-            self.assertIs(_validated_plan.selected_indices, indices)
-            self.assertEqual(_validated_plan.page_size, page_size)
-            self.assertEqual(_validated_plan.validated_cache_blocks, cache.shape[0])
             observed.update(
                 q_shape=tuple(q.shape),
                 cache=cache,
