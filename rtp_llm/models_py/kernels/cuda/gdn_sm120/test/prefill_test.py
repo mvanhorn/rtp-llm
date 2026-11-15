@@ -25,15 +25,17 @@ class GdnSm120PrefillTest(unittest.TestCase):
 
         self.assertEqual(torch.cuda.get_device_capability(), (12, 0))
         fixtures = []
-        for capacity, key_heads, heads, batch in (
-            (2048, 2, 4, 2),
-            (4096, 2, 4, 2),
-            (8192, 8, 24, 4),
-            (8192, 4, 12, 4),
-            (8192, 2, 6, 4),
+        for capacity, key_heads, heads, batch, live_output in (
+            (2048, 2, 4, 2, False),
+            (4096, 2, 4, 2, False),
+            (8192, 8, 24, 4, True),
+            (8192, 4, 12, 4, True),
+            (8192, 2, 6, 4, True),
         ):
             torch.manual_seed(837 + capacity)
-            prepared = GdnPrefillPrepared(capacity, batch, "cuda")
+            prepared = GdnPrefillPrepared(
+                capacity, batch, "cuda", output_live_only=live_output
+            )
             prepared.refresh((257, 129), (0, 128))
             prepared.require_prefix_alignment(128)
             q = torch.nn.functional.normalize(
@@ -173,6 +175,9 @@ class GdnSm120PrefillTest(unittest.TestCase):
                 initial.fill_(float("nan"))
                 checkpoints.fill_(float("nan"))
                 final.fill_(float("nan"))
+                # Every replay must overwrite live output, including after a
+                # larger request left this shared bank populated.
+                output.fill_(float("nan"))
                 graph.replay()
                 for current, source in zip(inputs, original):
                     torch.testing.assert_close(
@@ -233,7 +238,15 @@ class GdnSm120PrefillTest(unittest.TestCase):
                             )
                             touched.add(slot)
                     checkpoint += length // 128
-                torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+                if prepared.output_live_only:
+                    torch.testing.assert_close(
+                        output[:, : cu[-1]],
+                        expected_output[:, : cu[-1]],
+                        rtol=0,
+                        atol=0,
+                    )
+                else:
+                    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
                 torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
                 untouched = [
                     slot for slot in range(pool.shape[0]) if slot not in touched
