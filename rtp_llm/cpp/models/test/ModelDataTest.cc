@@ -552,6 +552,26 @@ TEST_F(ModelDataTest, testGenerationPrefillCudaGraphRunnerOwnershipIsLimitedToNo
     // prefill runner in the first implementation.
     EXPECT_FALSE(shouldCreateGenerationPrefillCudaGraph(config, true, true, RoleType::PDFUSION, SP_TYPE_NONE));
 
+    config.generation_prefill_graph_backend = "segmented";
+    EXPECT_TRUE(supportsGenerationPrefillCudaGraphExecutionMode(SP_TYPE_MTP, true, true));
+    EXPECT_FALSE(supportsGenerationPrefillCudaGraphExecutionMode(SP_TYPE_MTP, false, true));
+    EXPECT_FALSE(supportsGenerationPrefillCudaGraphExecutionMode(SP_TYPE_DSPARK, true, true));
+    EXPECT_TRUE(shouldCreateGenerationPrefillCudaGraph(config, true, false, RoleType::PDFUSION, SP_TYPE_MTP, true));
+    EXPECT_FALSE(shouldCreateGenerationPrefillCudaGraph(config, true, false, RoleType::PDFUSION, SP_TYPE_MTP));
+    EXPECT_FALSE(shouldCreateGenerationPrefillCudaGraph(config, true, true, RoleType::PDFUSION, SP_TYPE_MTP, true));
+    EXPECT_TRUE(isGenerationPrefillCudaGraphRequested(config, RoleType::PREFILL));
+    EXPECT_TRUE(shouldCreateGenerationPrefillCudaGraph(config, true, false, RoleType::PREFILL, SP_TYPE_NONE));
+    EXPECT_TRUE(shouldCreateGenerationPrefillCudaGraph(config, true, false, RoleType::PREFILL, SP_TYPE_MTP, true));
+    EXPECT_FALSE(shouldCreateGenerationPrefillCudaGraph(config, true, true, RoleType::PREFILL, SP_TYPE_MTP, true));
+    EXPECT_FALSE(shouldCreateGenerationPrefillCudaGraph(config, true, false, RoleType::PREFILL, SP_TYPE_MTP));
+    EXPECT_FALSE(isGenerationPrefillCudaGraphRequested(config, RoleType::DECODE));
+
+    config.generation_prefill_graph_backend = "disabled";
+    EXPECT_FALSE(isGenerationPrefillCudaGraphRequested(config, RoleType::PDFUSION));
+    config.generation_prefill_graph_backend = "full";
+    EXPECT_TRUE(isGenerationPrefillCudaGraphRequested(config, RoleType::PDFUSION));
+    config.generation_prefill_graph_backend.clear();
+
     config.enable_cuda_graph = false;
     EXPECT_FALSE(isGenerationPrefillCudaGraphRequested(config, RoleType::PDFUSION));
     EXPECT_FALSE(shouldCreateGenerationPrefillCudaGraph(config, true, false, RoleType::PDFUSION, SP_TYPE_NONE));
