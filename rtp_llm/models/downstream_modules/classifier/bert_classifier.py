@@ -23,6 +23,7 @@ class BertClassifierModule(CustomModule):
 
 
 class BertClassifierHandler(CustomHandler):
+    supports_batch_invariant = True
 
     def __init__(self, config: ModelConfig):
         super().__init__(config)
@@ -46,7 +47,7 @@ class BertClassifierHandler(CustomHandler):
         return weights
 
     def pooler(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pooled_output = self.dense(hidden_states)
+        pooled_output = self.project(self.dense, hidden_states)
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
@@ -76,9 +77,9 @@ class BertClassifierHandler(CustomHandler):
         # return self.linear(first_tokens)
         if self.device.type == "cpu":
             first_tokens = self.pooler(first_tokens)
-            first_tokens = self.linear(first_tokens)
+            first_tokens = self.project(self.linear, first_tokens)
             first_tokens = first_tokens.to(torch.float16)
             return first_tokens
         else:
             first_tokens = self.pooler(first_tokens)
-            return self.linear(first_tokens)
+            return self.project(self.linear, first_tokens)

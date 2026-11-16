@@ -7,6 +7,13 @@ _FIXTURE_DEPS = [
     ":qsa_fixtures",
 ]
 
+models_py_test(
+    name = "batch_invariant_ple_test",
+    src = "batch_invariant_ple_test.py",
+    gpu = "L20_CU13",
+    deps = ["//rtp_llm/models_py:models"],
+)
+
 py_library(
     name = "fixtures",
     srcs = ["fixtures.py"] + ["ple_page_reference.py"],

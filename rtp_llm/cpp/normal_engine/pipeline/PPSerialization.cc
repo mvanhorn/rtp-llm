@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/normal_engine/pipeline/PPSerialization.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -558,8 +559,17 @@ PPExecutionPlan deserializePlan(const torch::Tensor& buffer) {
 }
 
 torch::Tensor serializeExecutionResult(const PPExecutionResult& result) {
+    const auto has_raw_logprobs = std::any_of(result.request_outputs.begin(),
+                                              result.request_outputs.end(),
+                                              [](const auto& output) { return output.raw_logprobs.defined(); });
     return encodeToTensor([&](ByteEncoder& w) {
         executionResultFields(w, result);
+        // Only extend the wire payload for results carrying batch-invariant scores.
+        if (has_raw_logprobs) {
+            for (const auto& output : result.request_outputs) {
+                w.tensor(output.raw_logprobs);
+            }
+        }
     });
 }
 
@@ -567,6 +577,11 @@ PPExecutionResult deserializeExecutionResult(const torch::Tensor& buffer) {
     ByteReader r(buffer);
     PPExecutionResult result;
     executionResultFields(r, result);
+    if (r.remaining() != 0) {
+        for (auto& output : result.request_outputs) {
+            r.tensor(output.raw_logprobs);
+        }
+    }
     r.expectEnd();
     return result;
 }

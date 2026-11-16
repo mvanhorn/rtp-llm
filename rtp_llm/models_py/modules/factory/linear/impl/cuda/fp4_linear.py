@@ -52,6 +52,8 @@ class CudaFp4GEMMLinear(LinearBase):
         bias: Optional[torch.Tensor] = None,
         quant_config: object = None,
         weight_scale_2: Optional[torch.Tensor] = None,
+        *,
+        batch_invariant: bool = False,
     ):
         super().__init__(weight, weight_scales, input_scales,
                          bias, quant_config, weight_scale_2)
@@ -63,11 +65,38 @@ class CudaFp4GEMMLinear(LinearBase):
         self.weight_scale_2 = weight_scale_2
         self.input_scale = input_scales
         self.bias = bias
+        self.batch_invariant = batch_invariant
+        if batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant_nvfp4 import (
+                validate_nvfp4_weight,
+            )
+
+            validate_nvfp4_weight(weight, weight_scales, weight_scale_2, input_scales)
+            return
         self.backend = os.getenv("RTP_LLM_FP4_GEMM_BACKEND", "cutlass")
         self.alpha = self.weight_scale_2 * self.input_scale
         self.input_scale_inv = 1 / self.input_scale
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant import _launch_linear
+
+            if input.shape[-1] != self.hidden_size or input.dtype not in (
+                torch.bfloat16,
+                torch.float16,
+            ):
+                raise ValueError(
+                    "batch-invariant NVFP4 linear requires matching BF16 or FP16 inputs"
+                )
+            return _launch_linear(
+                input,
+                self.weight,
+                self.bias,
+                input.dtype,
+                weight_scales=self.weight_scales,
+                nvfp4_input_scale=self.input_scale,
+                nvfp4_weight_scale=self.weight_scale_2,
+            )
         # Get input dimensions
         input_m = input.shape[0]
         output_n = self.output_size
@@ -82,7 +111,7 @@ class CudaFp4GEMMLinear(LinearBase):
             )
             logger.error(error_msg)
             raise ValueError(error_msg)
-        
+
         if self.backend == "trtllm" and input.dtype == torch.float16:
             error_msg = (
                 "CudaFp4GEMMLinear with trtllm backend only supoorts bfloat16 input, "
@@ -94,7 +123,7 @@ class CudaFp4GEMMLinear(LinearBase):
         # Quantize BF16 or FP16 input to (FP4 and interleaved block scale)
         input_fp4, input_scale_interleaved = fp4_quantize(input, self.input_scale_inv)
         assert input_fp4.dtype == torch.uint8
-         
+
         if self.backend == "sgl_cutlass":
             output = cutlass_scaled_fp4_mm_wrapper(
                 input_fp4,
@@ -118,4 +147,3 @@ class CudaFp4GEMMLinear(LinearBase):
         if self.bias is not None:
             output = output + self.bias.to(output.dtype)
         return output
-

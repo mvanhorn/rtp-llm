@@ -1,3 +1,8 @@
 rtp-llm is developed by Alibaba and based on the FasterTransformer project
 Copyright (c) 2014-present, Alibaba Group
 Licensed under the Apache License, Version 2.0
+
+Portions of the CUDA batch_invariant.py and batch_invariant_mla.py kernels
+are adapted from vLLM v0.31.0, commit db9527a46873454610df6dbedf79a36d6bf1a7f6.
+Copyright contributors to the vLLM project
+Licensed under the Apache License, Version 2.0

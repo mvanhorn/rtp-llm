@@ -125,6 +125,7 @@ class Fp8Fp4MoeRuntimeConfig:
         self.head_num = 0
         self.moe_topk_group = 0
         self.quant_config = None
+        self.model_type = model_type
         self.model_config = SimpleNamespace(
             model_type=model_type,
             quant_config=None,
@@ -166,6 +167,7 @@ class Fp8Fp4MoeLayer(nn.Module):
         moe_w1_layout: str = "up_gate",
         physical_expert_num: Optional[int] = None,
         is_decode_role: bool = False,
+        hw_kernel_config=None,
     ) -> None:
         super().__init__()
         if n_shared_experts < 0:
@@ -176,6 +178,10 @@ class Fp8Fp4MoeLayer(nn.Module):
         self.dim = int(dim)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
         self.n_shared_experts = int(n_shared_experts)
+        batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
+        kernel_options = (
+            {"hw_kernel_config": hw_kernel_config} if batch_invariant else {}
+        )
         shared_w13 = layer_weights.get(W.ffn_w13)
         shared_s13 = layer_weights.get(W.ffn_s13)
         shared_fp8_block_size = (
@@ -195,6 +201,7 @@ class Fp8Fp4MoeLayer(nn.Module):
             n_hash_layers,
             vocab_size,
             layer_weights=layer_weights,
+            **({"batch_invariant": True} if batch_invariant else {}),
         )
         runtime_config = Fp8Fp4MoeRuntimeConfig(
             layer_id=layer_id,
@@ -220,7 +227,9 @@ class Fp8Fp4MoeLayer(nn.Module):
             is_decode_role=is_decode_role,
         )
         self.fused_moe = FusedMoeFactory().create_fused_moe(
-            runtime_config, layer_weights
+            runtime_config,
+            layer_weights,
+            **({"batch_invariant": True} if batch_invariant else {}),
         )
         self.strategy_name = self.fused_moe.strategy_name
         # MegaMoE formerly fused hash routing with input packing. Preserve its
@@ -246,14 +255,22 @@ class Fp8Fp4MoeLayer(nn.Module):
                     "w2_s": layer_weights[W.ffn_s2],
                 },
                 swiglu_limit=swiglu_limit,
+                **kernel_options,
             )
-            self._shared_executor = get_shared_expert_executor(
-                max_tokens_per_rank=max_tokens_per_rank,
-                dim=dim,
-                inter_dim=shared_inter_dim,
-                swiglu_limit=swiglu_limit,
-                native_mxfp8=shared_fp8_block_size == MXFP8_BLOCK,
-            )
+            if batch_invariant:
+                from rtp_llm.models_py.modules.factory.fused_moe.utils.fp8_fp4.shared_expert import (
+                    SequentialSharedExpertExecutor,
+                )
+
+                self._shared_executor = SequentialSharedExpertExecutor()
+            else:
+                self._shared_executor = get_shared_expert_executor(
+                    max_tokens_per_rank=max_tokens_per_rank,
+                    dim=dim,
+                    inter_dim=shared_inter_dim,
+                    swiglu_limit=swiglu_limit,
+                    native_mxfp8=shared_fp8_block_size == MXFP8_BLOCK,
+                )
             self._shared_executor.prepare(self.shared_experts)
 
     def forward(

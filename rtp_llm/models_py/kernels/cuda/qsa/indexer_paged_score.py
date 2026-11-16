@@ -117,6 +117,7 @@ def qsa_paged_indexer_score(
     max_ctx_len: Optional[int] = None,
     block_n: int = _BLOCK_N,
     validate_block_table: bool = True,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """Score one decode step against the paged indexer KV pool.
 
@@ -197,7 +198,8 @@ def qsa_paged_indexer_score(
     if M == 0 or max_ctx_len == 0:
         return torch.empty((M, max_ctx_len), device=q_bf16.device, dtype=torch.float32)
     if (
-        next_n >= 16
+        not batch_invariant
+        and next_n >= 16
         and H == 4
         and D == 128
         and block_n == _BLOCK_N

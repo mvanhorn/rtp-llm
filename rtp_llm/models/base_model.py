@@ -37,6 +37,7 @@ from rtp_llm.ops import (
     KVCacheSpecType,
     MoeConfig,
     ParallelismConfig,
+    TaskType,
 )
 from rtp_llm.utils.database import CkptDatabase
 from rtp_llm.utils.model_weight import sp_0_pad8_size
@@ -186,6 +187,13 @@ class BaseModel(object):
             raise Exception("current model can't support cuda graph in py model mode")
 
         self.custom_module = self._init_custom_module()
+        if (
+            getattr(self.hw_kernel_config, "batch_invariant", False)
+            and self.model_config.task_type != TaskType.LANGUAGE_MODEL
+        ):
+            if self.custom_module is None:
+                raise ValueError("RTP_BATCH_INVARIANT requires a downstream handler")
+            self.custom_module.get_handler().enable_batch_invariant()
         self.model_weights_loader = self.create_model_loader()
         self.py_eplb = self.model_weights_loader._py_eplb
         device_str = self._get_device_str()

@@ -339,6 +339,7 @@ def select_decode_tokens(
         # the score kernel also masks invalid IDs before reading the pool.
         validate_block_table=False,
         max_ctx_len=host_max_compressed,
+        batch_invariant=self.batch_invariant,
     )
     return select_qsa_paged_tokens(
         block_logits,
@@ -350,4 +351,5 @@ def select_decode_tokens(
         # a synchronization to every decode step.
         validate_lengths=False,
         scores_are_masked=True,
+        batch_invariant=self.batch_invariant,
     )

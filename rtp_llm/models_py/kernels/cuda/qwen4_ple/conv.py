@@ -65,26 +65,38 @@ def _ple_conv(
     tl.store(Output + offset, output, valid)
 
 
-def try_ple_conv(gated, normed, initial, weight, dilation, *, residual=None):
+def try_ple_conv(
+    gated, normed, initial, weight, dilation, *, residual=None, batch_invariant=False
+):
+    if gated.ndim != 3 or weight.ndim != 3:
+        return None
+    width = gated.shape[-1]
+    kernel = weight.shape[-1]
+    state_len = (kernel - 1) * dilation
     if not (
         gated.is_cuda
         and torch.version.hip is None
-        and torch.cuda.get_device_capability(gated.device) == (12, 0)
+        and (
+            batch_invariant
+            or (
+                torch.cuda.get_device_capability(gated.device) == (12, 0)
+                and width == 10240
+                and kernel == 4
+                and dilation == 3
+            )
+        )
         and gated.dtype == normed.dtype == weight.dtype == torch.bfloat16
-        and gated.ndim == 3
         and gated.shape == normed.shape
-        and gated.shape[-1] == 10240
         and gated.shape[1] > 0
         and gated.is_contiguous()
         and normed.is_contiguous()
-        and weight.shape == (10240, 1, 4)
+        and weight.shape == (width, 1, kernel)
         and weight.is_contiguous()
         and gated.device == normed.device == weight.device
-        and dilation == 3
         and (
             initial is None
             or (
-                initial.shape == (gated.shape[0], 9, 10240)
+                initial.shape == (gated.shape[0], state_len, width)
                 and initial.dtype == gated.dtype
                 and initial.device == gated.device
                 and initial.stride(-1) == 1
@@ -112,9 +124,9 @@ def try_ple_conv(gated, normed, initial, weight, dilation, *, residual=None):
         output,
         residual if residual is not None else gated,
         LENGTH=gated.shape[1],
-        WIDTH=10240,
-        KERNEL=4,
-        DILATION=3,
+        WIDTH=width,
+        KERNEL=kernel,
+        DILATION=dilation,
         HAS_INITIAL=initial is not None,
         HAS_RESIDUAL=residual is not None,
         INITIAL_BATCH_STRIDE=initial.stride(0) if initial is not None else 0,

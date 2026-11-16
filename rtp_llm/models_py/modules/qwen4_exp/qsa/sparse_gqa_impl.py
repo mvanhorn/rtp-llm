@@ -49,15 +49,21 @@ from .fmha_plans import IncrementalPrefillInputs, PagedInputs
 class SparseGqaFmhaImpl(FMHAImplBase):
     """Block-sparse GQA attention for qwen4 prefill and paged decode."""
 
+    batch_invariant = False
+
     def __init__(
         self,
         attn_configs: AttentionConfigs,
         attn_inputs: PyAttentionInputs,
         parallelism_config: Optional[ParallelismConfig] = None,
+        *,
+        batch_invariant: bool = False,
+        batch_invariant_rope_cache: torch.Tensor | None = None,
     ) -> None:
         self.attn_configs = attn_configs
         self.attn_inputs = attn_inputs
         self.parallelism_config = parallelism_config
+        self.batch_invariant = batch_invariant
         self.head_num = attn_configs.head_num
         self.kv_head_num = attn_configs.kv_head_num
         self.head_dim = attn_configs.size_per_head
@@ -78,6 +84,15 @@ class SparseGqaFmhaImpl(FMHAImplBase):
         self._qsa_target_visible_lengths = None
         self._qsa_main_geometry = None
         self._validate_runtime_mode()
+        if batch_invariant:
+            from rtp_llm.models_py.modules.factory.attention.cuda_impl.batch_invariant import (
+                BatchInvariantAttention,
+            )
+
+            self.invariant_attention = BatchInvariantAttention(
+                attn_configs, attn_inputs, batch_invariant_rope_cache
+            )
+            return
         rope_writer_cls = (
             FusedRopeKVCachePrefillOpQKVOut
             if self.is_prefill
@@ -165,7 +180,7 @@ class SparseGqaFmhaImpl(FMHAImplBase):
         return (
             self.is_prefill
             and not self.is_target_verify
-            and self._has_nonzero_prefill_prefix()
+            and (self.batch_invariant or self._has_nonzero_prefill_prefix())
         )
 
     def _has_nonzero_prefill_prefix(self) -> bool:
@@ -354,7 +369,11 @@ class SparseGqaFmhaImpl(FMHAImplBase):
     def support_cuda_graph(self) -> bool:
         return bool(
             self.attn_inputs.is_cuda_graph
-            and (not self.is_prefill or self.is_target_verify or self._is_draft_graph())
+            and (
+                not self.is_prefill
+                or self.is_target_verify
+                or (not self.batch_invariant and self._is_draft_graph())
+            )
         )
 
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs) -> None:
@@ -363,6 +382,8 @@ class SparseGqaFmhaImpl(FMHAImplBase):
             raise RuntimeError(
                 "qwen4_exp sparse GQA graph prepare requires a graph role"
             )
+        if self.batch_invariant:
+            return
         if self.is_target_verify or self._is_draft_graph():
             offset = self.rope_kvcache_impl.prepare_kv_cache_offset(attn_inputs)
         else:
@@ -383,6 +404,10 @@ class SparseGqaFmhaImpl(FMHAImplBase):
     def forward_with_qk_norm_and_output_gate(
         self, qkv, kv_cache, layer_idx, gate, norm
     ):
+        if self.batch_invariant:
+            return self.forward(
+                norm(qkv) if norm is not None else qkv, kv_cache, layer_idx
+            ) * torch.sigmoid(gate)
         if (
             norm is not None
             and self.is_target_verify
@@ -412,6 +437,8 @@ class SparseGqaFmhaImpl(FMHAImplBase):
         )
 
     def forward_with_output_gate(self, qkv, kv_cache, layer_idx, gate):
+        if self.batch_invariant:
+            return self.forward(qkv, kv_cache, layer_idx) * torch.sigmoid(gate)
         if (
             (
                 self.is_target_verify
@@ -468,7 +495,47 @@ class SparseGqaFmhaImpl(FMHAImplBase):
                 "the attention module must run the indexer and pass it in"
             )
 
-        self._paged_kv_scale_args(kv_cache)
+        kv_scale_args = self._paged_kv_scale_args(kv_cache)
+        if self.batch_invariant:
+            if kv_cache is None:
+                raise ValueError("batch-invariant QSA requires the main KV cache")
+            if self._is_draft_graph():
+                raise ValueError(
+                    "batch-invariant QSA does not support draft prefill CUDA Graph"
+                )
+            if (
+                selected_indices.ndim != 2
+                or selected_indices.shape[0] != qkv.shape[0]
+                or selected_indices.dtype != torch.int32
+                or selected_indices.device != qkv.device
+            ):
+                raise ValueError(
+                    "batch-invariant QSA requires packed int32 token selections"
+                )
+            from rtp_llm.models_py.kernels.cuda.qsa.sparse_paged_fmha import (
+                batch_invariant_sparse_paged_gqa,
+            )
+
+            self._selected_indices = None
+            self._trusted_prefill_cu_seqlens = None
+            if qk_norm is not None:
+                qkv = qk_norm(qkv)
+            self._qsa_main_cache_mutation_started = True
+            q, _, _, layout, cache, pages, _ = self.invariant_attention.prepare_qkv(
+                qkv, kv_cache
+            )
+            output = batch_invariant_sparse_paged_gqa(
+                q,
+                cache,
+                pages,
+                layout,
+                selected_indices,
+                scale=self.invariant_attention.scale,
+                **kv_scale_args,
+            ).flatten(1)
+            return (
+                output if output_gate is None else output * torch.sigmoid(output_gate)
+            )
         if self._is_draft_graph():
             output = self._forward_draft_graph(
                 qkv, kv_cache, selected_indices, output_gate

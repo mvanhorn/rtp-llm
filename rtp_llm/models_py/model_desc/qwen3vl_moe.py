@@ -25,6 +25,8 @@ from rtp_llm.utils.model_weight import W
 class Qwen3VLMoeModel(GptModelBase):
     """Qwen3VL MoE model"""
 
+    supports_batch_invariant = True
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -72,7 +74,9 @@ class Qwen3VLMoeModel(GptModelBase):
             ]
         )
         self.norm = RMSResNorm(
-            weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
+            weights.get_global_weight(W.final_ln_gamma),
+            eps=model_config.layernorm_eps,
+            **({"batch_invariant": True} if self.batch_invariant else {}),
         )
         self._init_capture_context(
             self._capture_canonical_layer,

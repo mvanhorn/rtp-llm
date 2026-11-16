@@ -382,6 +382,8 @@ class OnlineModelOptFp4MoeWeight(CompositeWeight, QuantWeight):
         load_config: LoadConfig,
     ):
         processed = super()._postprocess(tensor, device, load_config)
+        if load_config.batch_invariant:
+            return processed
         kernel_w = processed[self.kernel.name]
         scale_w = processed[self.scale.name]
         kernel_w, scale_w = (

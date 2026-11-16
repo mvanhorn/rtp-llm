@@ -480,6 +480,55 @@ class Qwen3NextGatedDeltaNetBase(torch.nn.Module):
         ssm_states = self.linear_cache_converter.get_ssm_state_tensor(kv_cache_tensor)
         return ssm_states
 
+    def forward_batch_invariant(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        inputs: PyAttentionInputs,
+        kv_cache: Optional[LayerKVCache],
+    ) -> torch.Tensor:
+        from rtp_llm.models_py.triton_kernels.fla.batch_invariant_gdn import (
+            batch_invariant_gated_delta_rule,
+        )
+
+        if inputs.context_parallel_info is not None:
+            raise ValueError("batch-invariant Gated DeltaNet does not support CP")
+        cache = kv_cache.kv_cache_base if kv_cache is not None else None
+        g, beta = fused_gdn_gating(self.alog, a, b, self.dt_bias)
+        cu_seqlens = (
+            inputs.cu_seqlens_device
+            if inputs.is_prefill
+            else inputs.decode_cu_seqlens_device
+        )
+        lengths = (
+            inputs.prefix_lengths_device
+            if inputs.is_prefill and not inputs.is_target_verify
+            else inputs.sequence_lengths_plus_1_device
+        )
+        return batch_invariant_gated_delta_rule(
+            mixed_qkv,
+            self.conv_weights,
+            g,
+            beta,
+            cu_seqlens=cu_seqlens,
+            lengths=lengths,
+            block_map=(
+                inputs.kv_cache_kernel_block_id_device if cache is not None else None
+            ),
+            conv_state=self._get_conv_states(cache) if cache is not None else None,
+            ssm_state=self._get_ssm_states(cache) if cache is not None else None,
+            conv_dtype=self.conv_state_dtype,
+            ssm_dtype=self.ssm_state_dtype,
+            seq_size_per_block=kv_cache.seq_size_per_block if cache is not None else 1,
+            key_heads=self.local_num_k_heads,
+            value_heads=self.local_num_v_heads,
+            key_dim=self.head_k_dim,
+            value_dim=self.head_v_dim,
+            is_decode=not inputs.is_prefill,
+            is_target_verify=inputs.is_target_verify,
+        )
+
 
 class Qwen3NextGatedDeltaNetPrefill(Qwen3NextGatedDeltaNetBase):
     def __init__(
@@ -1025,6 +1074,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ):
         super().__init__()
         self.linear_factory = linear_factory or LinearFactory
+        self.batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
         self.linear_attn_config = linear_attn_config
         self.parallelism_config = parallelism_config
         self.weights = weights
@@ -1363,7 +1413,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         assert attention_inputs is not None, "attention_inputs is required"
         assert (
-            attention_inputs.is_target_verify
+            self.batch_invariant
+            or attention_inputs.is_target_verify
             or not attention_inputs.is_prefill
             or attn_meta.get_prefill_conv1d_meta() is not None
             or attn_meta.is_cp_linear_attn
@@ -1372,7 +1423,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         mixed_qkv, z, b, a = self.fix_query_key_value_ordering(
             projected_states_qkvz, projected_states_ba
         )
-        if attention_inputs.is_prefill and not attn_meta.is_target_verify:
+        if self.batch_invariant:
+            attn_output = self.prefill_gdn.forward_batch_invariant(
+                mixed_qkv, b, a, attention_inputs, kv_cache
+            )
+        elif attention_inputs.is_prefill and not attn_meta.is_target_verify:
             if attn_meta.is_cp_linear_attn:
                 return self._forward_cp_prefill(
                     mixed_qkv, z, b, a, attention_inputs, kv_cache, attn_meta
@@ -1392,7 +1447,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         attn_output = self._output_project(attn_output, z)
         if self.parallelism_config.get_attn_tp_size() > 1:
             reduce_output = getattr(self, "tp_all_reduce", all_reduce)
-            attn_output = reduce_output(attn_output, group=Group.TP)
+            attn_output = reduce_output(
+                attn_output,
+                group=Group.TP,
+                **({"batch_invariant": True} if self.batch_invariant else {}),
+            )
         return attn_output
 
 
@@ -1412,6 +1471,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         hw_kernel_config: Optional["HWKernelConfig"] = None,
     ):
         super().__init__()
+        self.batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
         self.layer_idx = layer_idx
         self.layer_type = config.hybrid_attention_config.hybrid_attention_types[
             layer_idx
@@ -1486,11 +1546,12 @@ class Qwen3NextDecoderLayer(nn.Module):
     def _build_residual_modules(
         self, config: ModelConfig, weights: Dict[str, torch.Tensor]
     ) -> None:
+        norm_options = {"batch_invariant": True} if self.batch_invariant else {}
         self.input_layernorm = RMSResNorm(
-            weights[W.pre_ln_gamma], eps=config.layernorm_eps
+            weights[W.pre_ln_gamma], eps=config.layernorm_eps, **norm_options
         )
         self.post_attention_layernorm = RMSResNorm(
-            weights[W.post_ln_gamma], eps=config.layernorm_eps
+            weights[W.post_ln_gamma], eps=config.layernorm_eps, **norm_options
         )
 
     def forward(
@@ -1520,6 +1581,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 class Qwen3NextModel(GptModelBase):
+    supports_batch_invariant = True
     _decoder_layer_cls = Qwen3NextDecoderLayer
 
     def __init__(
@@ -1578,6 +1640,7 @@ class Qwen3NextModel(GptModelBase):
             RMSResNorm(
                 weights.get_global_weight(W.final_ln_gamma),
                 eps=model_config.layernorm_eps,
+                **({"batch_invariant": True} if self.batch_invariant else {}),
             )
             if self.layer_num - 1 in self.layer_ids()
             else None
@@ -1743,6 +1806,11 @@ class Qwen3NextModel(GptModelBase):
         linear_attention_inputs: Optional[PyAttentionInputs] = None,
     ) -> Qwen3NextMetadata:
         attention_inputs = get_primary_attention_inputs(inputs, self.kv_cache)
+        if getattr(self, "batch_invariant", False):
+            return Qwen3NextMetadata(
+                is_target_verify=attention_inputs.is_target_verify,
+                is_cuda_graph=is_cuda_graph,
+            )
         linear_layer_idx = next(
             (
                 layer_idx

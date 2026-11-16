@@ -77,6 +77,8 @@ class DenseEmbeddingRenderer(EmbeddingRendererBase):
 
 
 class NormalHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.is_causal = config.attn_config.is_causal
@@ -91,11 +93,17 @@ class NormalHandler(CustomHandler):
             ts = get_last_token_from_combo_tokens(hidden_states, input_lengths)
         else:
             ts = get_first_token_from_combo_tokens(hidden_states, input_lengths)
-        ts = torch.nn.functional.normalize(ts, dim=1)
-        return ts
+        if self.batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant_norm import (
+                l2_normalize,
+            )
+
+            return l2_normalize(ts)
+        return torch.nn.functional.normalize(ts, dim=1)
 
 
 class SentenceTransformerHandler(CustomHandler):
+    supports_batch_invariant = True
     arg_name_mapping = {
         "token_embeddings": "hidden_states",
     }
@@ -176,6 +184,10 @@ class SentenceTransformerHandler(CustomHandler):
     def extend_forward_args(self) -> List[str]:
         return self.extend_forward_args_list
 
+    def enable_batch_invariant(self) -> None:
+        super().enable_batch_invariant()
+        self.model.eval()
+
     def extend_forward(
         self,
         **combo_data: Any,
@@ -185,9 +197,32 @@ class SentenceTransformerHandler(CustomHandler):
         return self.extend_forward_internal(batch_data)
 
     def extend_forward_internal(self, data: Dict[str, torch.Tensor]):
+        input_lengths = data["input_lengths"]
         data = {
             k: data[self.arg_name_mapping.get(k, k)]
             for k in self.raw_extend_forward_args_list
         }
 
-        return self.model(data)["sentence_embedding"]
+        if not self.batch_invariant:
+            return self.model(data)["sentence_embedding"]
+        # Sequence pooling must keep its reduction width when a longer
+        # request is packed alongside it. Keep the encoder forward batched.
+        results = []
+        for row, length in enumerate(input_lengths.tolist()):
+            features = {
+                key: self._request_feature(key, value, row, length)
+                for key, value in data.items()
+            }
+            results.append(self.model(features)["sentence_embedding"])
+        return torch.cat(results, dim=0)
+
+    @staticmethod
+    def _request_feature(key: str, value: Any, row: int, length: int) -> Any:
+        if key == "moe_gating":
+            return [
+                gate[row : row + 1, :length] if gate is not None else None
+                for gate in value
+            ]
+        if key == "input_lengths":
+            return value[row : row + 1]
+        return value[row : row + 1, :length].contiguous()

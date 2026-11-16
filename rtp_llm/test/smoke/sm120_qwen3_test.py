@@ -12,6 +12,7 @@ import requests
 import torch
 from transformers import AutoTokenizer
 
+from rtp_llm.config.py_config_modules import ServerConfig
 from rtp_llm.test.utils.maga_server_manager import MagaServerManager
 
 FIXTURE = Path(__file__).parent / "data/model/qwen3/q_r_1_7b_bf16_sm120.json"
@@ -21,6 +22,12 @@ BLOCK_SIZE = 64
 class SM120Qwen3Test(unittest.TestCase):
     def setUp(self):
         self.fixture = json.loads(FIXTURE.read_text())
+        self.fixture["model_type"] = os.environ.get(
+            "RTP_TEST_MODEL_TYPE", self.fixture["model_type"]
+        )
+        self.fixture["model_path"] = os.environ.get(
+            "RTP_TEST_MODEL_PATH", self.fixture["model_path"]
+        )
         self.output_dir = Path(os.environ["TEST_UNDECLARED_OUTPUTS_DIR"])
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.fixture["model_path"], local_files_only=True
@@ -71,9 +78,9 @@ class SM120Qwen3Test(unittest.TestCase):
             },
         }
 
-    def request(self, label, query, endpoint="/", streaming=False):
+    def request(self, label, query, endpoint="/", streaming=False, *, port=None):
         response = self.session.post(
-            f"http://127.0.0.1:{self.server.port}{endpoint}",
+            f"http://127.0.0.1:{port if port is not None else self.server.port}{endpoint}",
             json=query,
             timeout=300,
             stream=streaming,
@@ -324,14 +331,40 @@ class SM120Qwen3Test(unittest.TestCase):
         self.assertIn("1", matches, "No runtime decode Graph replay for batch 1")
         self.assertIn("2", matches, "No runtime decode Graph replay for batch 2")
 
-    def check_batch_invariant_scores(self):
+    def check_batch_invariant_scores(self, *, check_graph=True, image_url=None):
+        prompt = "Write one short sentence about a lighthouse."
+        if image_url is not None:
+            prompt = (
+                "<|vision_start|><|image_pad|><|vision_end|>\n"
+                "Describe the main color of this image."
+            )
         query = self.query(
-            self.prompt("Write one short sentence about a lighthouse."),
+            self.prompt(prompt),
             max_new_tokens=8,
+            top_k=20,
+            top_p=0.9,
+            temperature=0.8,
             random_seed=42,
             return_softmax_probs=True,
         )
-        solo = self.request("invariant_solo", query)
+        if image_url is not None:
+            query["images"] = [image_url]
+            query["generate_config"]["min_new_tokens"] = 8
+        backend = ServerConfig()
+        backend.start_port = self.server.port
+
+        def native_result(label, request, target_row=None):
+            result = self.request(label, request, port=backend.http_port)
+            if target_row is not None:
+                result = result["response_batch"][target_row]
+            self.assertEqual(len(result["aux_info"]), 1)
+            result["aux_info"] = result["aux_info"][0]
+            return result
+
+        if image_url is None:
+            solo = self.request("invariant_solo", query)
+        else:
+            solo = native_result("invariant_solo", query)
         scores = solo["aux_info"]["raw_logprobs"]
         self.assertEqual(len(scores), len(solo["output_ids"][0]))
         self.assertGreater(len(scores), 1)
@@ -339,40 +372,178 @@ class SM120Qwen3Test(unittest.TestCase):
         for target_row, prompts in enumerate(
             ((query["prompt"], other), (other, query["prompt"]))
         ):
-            result = self.request(
-                f"invariant_batch_{target_row}",
-                {
-                    "prompt_batch": list(prompts),
-                    "generate_config": query["generate_config"],
-                },
-                "/batch_infer",
-            )["response_batch"][target_row]
-            self.assertEqual(result["output_ids"], solo["output_ids"])
-            self.assertEqual(result["aux_info"]["raw_logprobs"], scores)
+            batch_query = {
+                "prompt_batch": list(prompts),
+                "generate_config": query["generate_config"],
+            }
+            if image_url is not None:
+                batch_query["images"] = [[], []]
+                batch_query["images"][target_row] = [image_url]
+            # The backend submits both prompts to the scheduler as one group.
+            result = native_result(
+                f"invariant_batch_{target_row}", batch_query, target_row
+            )
+            self.check_invariant_result(solo, result)
 
+        if image_url is not None:
+            self.assertGreater(
+                solo["aux_info"]["input_len"],
+                len(self.tokenizer.encode(query["prompt"])),
+                "the service did not expand the image placeholder",
+            )
+        else:
+            self.check_prompt_rescore(solo, scores)
+        if check_graph:
+            self.check_graph()
+
+    def check_prompt_rescore(self, solo, scores):
         # Re-score the generated continuation as prompt tokens. Each label is
         # scored by the same prefix as in the original generation.
         tokens = solo["input_ids"][0] + solo["output_ids"][0]
         text = self.tokenizer.decode(tokens, clean_up_tokenization_spaces=False)
-        if self.tokenizer.encode(text) != tokens:
-            self.fail("score test prompt did not round-trip through the tokenizer")
-        rescored = self.request(
-            "invariant_rescore",
-            self.query(
-                text,
-                max_new_tokens=1,
-                return_prompt_logits=True,
-                prompt_logits_top_k=1,
-                prompt_logits_start=len(solo["input_ids"][0]) - 1,
-                prompt_logits_end=len(tokens) - 1,
-            ),
+        start, end = len(solo["input_ids"][0]) - 1, len(tokens) - 1
+        if self.tokenizer.encode(text) == tokens:
+            rescored = self.request(
+                "invariant_rescore",
+                self.query(
+                    text,
+                    max_new_tokens=1,
+                    return_prompt_logits=True,
+                    prompt_logits_top_k=1,
+                    prompt_logits_start=start,
+                    prompt_logits_end=end,
+                ),
+            )["prompt_logprobs"]["target_logprobs"]
+        else:
+            # Sampled token boundaries can disappear on re-encoding. Score
+            # their original IDs through the engine's token-based endpoint.
+            rescored = self.score_token_ids(tokens, start, end)
+        self.check_logprob_bits(rescored, scores)
+
+    def score_token_ids(self, tokens, start, end):
+        import time
+
+        import grpc
+
+        from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
+            GenerateConfigPB,
+            GenerateInputPB,
         )
-        self.assertEqual(rescored["prompt_logprobs"]["target_logprobs"], scores)
-        self.check_graph()
+        from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2_grpc import (
+            RpcServiceStub,
+        )
+        from rtp_llm.utils.grpc_util import trans_tensor
+
+        server = ServerConfig()
+        server.start_port = self.server.port
+        now = time.time_ns()
+        config = GenerateConfigPB(
+            max_new_tokens=1,
+            num_beams=1,
+            num_return_sequences=1,
+            top_k=1,
+            top_p=1.0,
+            temperature=1.0,
+            repetition_penalty=1.0,
+            return_prompt_logits=True,
+            prompt_logits_top_k=1,
+            prompt_logits_start=start,
+            prompt_logits_end=end,
+            return_target_logprob=True,
+        )
+        query = GenerateInputPB(
+            request_id=now,
+            start_time=now // 1000,
+            token_ids=tokens,
+            generate_config=config,
+        )
+        with grpc.insecure_channel(f"127.0.0.1:{server.rpc_server_port}") as channel:
+            for result in RpcServiceStub(channel).GenerateStreamCall(query, timeout=60):
+                if result.flatten_output.HasField("prompt_logits"):
+                    scores = trans_tensor(
+                        result.flatten_output.prompt_logits.target_logprobs
+                    )
+                    self.assertEqual(scores.dtype, torch.float32)
+                    self.save("invariant_rescore_rpc.json", scores.tolist())
+                    return scores.tolist()
+        self.fail("prompt scoring RPC did not return logprobs")
+
+    def check_logprob_bits(self, actual, expected):
+        actual = torch.tensor(actual, dtype=torch.float32).view(torch.int32)
+        expected = torch.tensor(expected, dtype=torch.float32).view(torch.int32)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def check_invariant_result(self, reference, actual):
+        self.check_same(reference, actual)
+        self.check_logprob_bits(
+            actual["aux_info"]["raw_logprobs"], reference["aux_info"]["raw_logprobs"]
+        )
+
+    def check_chunked_invariant_scores(self):
+        context = "".join(
+            f"Record {i}: the lighthouse is painted red.\n" for i in range(64)
+        )
+        query = self.query(
+            self.prompt(context + "\nDescribe the lighthouse briefly."),
+            max_new_tokens=8,
+            top_k=20,
+            top_p=0.9,
+            temperature=0.8,
+            random_seed=42,
+            return_softmax_probs=True,
+        )
+        solo = self.request("chunked_invariant_solo", query)
+        self.check_single(solo)
+        self.assertEqual(solo["aux_info"]["reuse_len"], 0)
+        self.assertGreater(solo["aux_info"]["input_len"], 2 * 128)
+        cached_query = dict(
+            query, generate_config=dict(query["generate_config"], reuse_cache=True)
+        )
+        cold = self.request("chunked_invariant_cache_cold", cached_query)
+        cached = self.request("chunked_invariant_cache_hit", cached_query)
+        self.check_invariant_result(solo, cold)
+        self.check_invariant_result(solo, cached)
+        self.assertEqual(cold["aux_info"]["reuse_len"], 0)
+        self.assertGreaterEqual(cached["aux_info"]["reuse_len"], 2 * BLOCK_SIZE)
+        with open(self.server.log_file_path, "rb") as log:
+            log.seek(self.log_offset)
+            runtime = log.read().decode(errors="replace")
+        advances = re.findall(
+            r"\[chunked_prefill\] stream (\d+) advanced to (\d+) of (\d+) tokens",
+            runtime,
+        )
+        self.assertTrue(any(prefix == "128" for _, prefix, _ in advances), advances)
+        self.assertTrue(any(prefix == "256" for _, prefix, _ in advances), advances)
+        self.assertRegex(
+            runtime,
+            r"using CUDA graph forward, is_target_verify=0, is_prefill=0, graph_bs=1",
+        )
+        self.save(
+            "chunked_coverage.json",
+            {"advances": advances, "cache_hit_tokens": cached["aux_info"]["reuse_len"]},
+        )
 
     def test_requests_share_one_server(self):
-        if os.environ.get("RTP_TEST_BATCH_INVARIANT") == "1":
-            self.check_batch_invariant_scores()
+        mode = os.environ.get("RTP_TEST_BATCH_INVARIANT")
+        if mode in ("1", "pp"):
+            image_url = None
+            if os.environ.get("RTP_TEST_BATCH_INVARIANT_IMAGE") == "1":
+                from base64 import b64encode
+                from io import BytesIO
+
+                from PIL import Image
+
+                buffer = BytesIO()
+                Image.new("RGB", (128, 128), "blue").save(buffer, format="PNG")
+                image_url = (
+                    "data:image/png;base64," + b64encode(buffer.getvalue()).decode()
+                )
+            self.check_batch_invariant_scores(
+                check_graph=mode == "1", image_url=image_url
+            )
+            return
+        if mode == "chunked":
+            self.check_chunked_invariant_scores()
             return
         # One test method owns the server; helper phases never restart it.
         with self.subTest(scenario="long_prefix_cache"):

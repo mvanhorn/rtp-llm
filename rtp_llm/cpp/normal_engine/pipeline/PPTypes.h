@@ -116,6 +116,7 @@ struct PPRequestOutput {
     torch::Tensor all_hidden_states; /** [request_executed_token_count, hidden_size] */
 
     std::optional<PromptLogitsOutput> prompt_logits;
+    torch::Tensor                     raw_logprobs; /** FP32 [request_batch_size, new_token_count] */
 };
 
 /** Final outputs produced by the lm-head stage TP root. */

@@ -45,6 +45,8 @@ class MlaAttention(nn.Module):
         self.softmax_scale = self.q_head_dim ** (-0.5)
         self.layer_idx = layer_idx
         self.token_per_block = attn_config.kernel_tokens_per_block
+        self.batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
+        norm_options = {"batch_invariant": True} if self.batch_invariant else {}
 
         if attn_config.is_sparse:
             self.indexer = Indexer(
@@ -70,7 +72,9 @@ class MlaAttention(nn.Module):
                 hw_kernel_config=hw_kernel_config,
             )
             self.q_a_layernorm = RMSNorm(
-                weights.get(W.mla_q_a_ln_gamma, None), eps=layernorm_eps
+                weights.get(W.mla_q_a_ln_gamma, None),
+                eps=layernorm_eps,
+                **norm_options,
             )
             self.q_b_proj = LinearFactory.create_linear_from_weights(
                 weights,
@@ -91,7 +95,9 @@ class MlaAttention(nn.Module):
             )
 
         self.kv_a_layernorm = RMSNorm(
-            weights.get(W.mla_kv_a_ln_gamma, None), eps=layernorm_eps
+            weights.get(W.mla_kv_a_ln_gamma, None),
+            eps=layernorm_eps,
+            **norm_options,
         )
 
         self.o_proj = LinearFactory.create_linear_from_weights(
@@ -114,15 +120,29 @@ class MlaAttention(nn.Module):
         if self.indexer is None or kv_cache is None:
             return None
         q_for_indexer = q_c if self.q_lora_rank > 0 else q_view
-        topk_indices = self.indexer(
-            hidden_states,
-            q_for_indexer,
-            kv_cache,
-            fmha_impl.fmha_params,
-            fmha_impl.attn_inputs,
-            use_fast_path=not fmha_impl.is_sparse(),
-            cp_params=fmha_impl.cp_params,
-        )
+        if self.batch_invariant:
+            if hidden_states.shape[0] == 0:
+                return None
+            from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.batch_invariant import (
+                BatchInvariantMlaAttention,
+            )
+
+            assert isinstance(fmha_impl, BatchInvariantMlaAttention)
+            layout, pages = fmha_impl.prepare_metadata(hidden_states.shape[0], kv_cache)
+            assert pages is not None and q_for_indexer is not None
+            topk_indices = self.indexer.forward_batch_invariant(
+                hidden_states, q_for_indexer, kv_cache, layout, pages
+            )
+        else:
+            topk_indices = self.indexer(
+                hidden_states,
+                q_for_indexer,
+                kv_cache,
+                fmha_impl.fmha_params,
+                fmha_impl.attn_inputs,
+                use_fast_path=not fmha_impl.is_sparse(),
+                cp_params=fmha_impl.cp_params,
+            )
         attn_inputs = fmha_impl.attn_inputs
         if (
             attn_inputs.is_prefill
@@ -237,5 +257,7 @@ class MlaAttention(nn.Module):
             )
         attn_output = self.o_proj(attn_output)
         if self.parallelism_config.get_attn_tp_size() > 1:
-            attn_output = all_reduce(attn_output, group=Group.TP)
+            attn_output = all_reduce(
+                attn_output, group=Group.TP, batch_invariant=self.batch_invariant
+            )
         return attn_output

@@ -64,6 +64,14 @@ class Qwen3_VLImageEmbedding(Qwen2_5_VLImageEmbedding):
         self.visual = Qwen3VLVisionModel._from_config(config_hf.vision_config)
         self.spatial_merge_size = self.visual.spatial_merge_size
 
+    def enable_batch_invariant(self) -> None:
+        from rtp_llm.multimodal.multimodal_mixins.batch_invariant_vision import (
+            enable_qwen_vision_batch_invariant,
+        )
+
+        enable_qwen_vision_batch_invariant(self.visual)
+        self.batch_invariant = True
+
     @property
     def _data_type(self):
         return self.visual.dtype
@@ -233,6 +241,9 @@ class Qwen3VLVitWeight(BaseVitWeights):
 
 
 class Qwen3_VLMixin(Qwen2_5_VLMixin):
+    def enable_batch_invariant(self) -> None:
+        self.mm_part.enable_batch_invariant()
+
     def _init_multimodal(self):
         self.mm_part = Qwen3_VLImageEmbedding(self.mm_related_params)
         self.mm_related_params.vit_weights = Qwen3VLVitWeight(

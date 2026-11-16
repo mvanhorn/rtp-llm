@@ -250,6 +250,8 @@ class DeepSeekVLV2VitWeight(BaseVitWeights):
 
 
 class DeepSeekVLV2Mixin(BaseMultiModalMixin):
+    supports_batch_invariant = True
+
     # override
     def _init_multimodal(self):
         self.mm_part = DeepSeekVLV2ImageEmbedding(self.mm_related_params)

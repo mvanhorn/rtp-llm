@@ -209,6 +209,16 @@ py_test(
 )
 
 py_test(
+    name = "qwen3_vl_batch_invariant_embedding_test",
+    main = "qwen3_vl_embedding_test.py",
+    srcs = ["qwen3_vl_embedding_test.py"],
+    args = ["Qwen3VLEmbeddingTest.test_batch_invariant_vision_embeddings"],
+    deps = ["//rtp_llm:testlib"],
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13", "gpu_count": "1"},
+)
+
+py_test(
     name = "deepseek_v41_processor_test",
     srcs = ["deepseek_v41_processor_test.py"],
     deps = ["//rtp_llm:testlib"],

@@ -789,6 +789,11 @@ class MMProcessEngine:
             )
             self._remote_embedding_cache = MMRemoteEmbeddingCache(
                 client,
+                key_prefix=(
+                    "RTP_BATCH_INVARIANT:"
+                    if getattr(mm_part, "batch_invariant", False)
+                    else ""
+                ),
                 max_object_bytes=limits[0],
                 max_inflight_bytes=limits[1],
                 max_pending=limits[2],

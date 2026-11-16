@@ -660,7 +660,9 @@ def _incremental_prefill_selection(
     )
 
     if not draft:
-        return _select_prefix_prefill_chunks(rotated_q, score_weights, plan)
+        return _select_prefix_prefill_chunks(
+            rotated_q, score_weights, plan, batch_invariant=self.batch_invariant
+        )
 
     # The draft has at most one compression group's worth of rows per
     # request. Pad only that short dimension so all requests share one
@@ -691,6 +693,7 @@ def _incremental_prefill_selection(
         block_size=int(plan.kv_entries_per_block),
         max_ctx_len=int(plan.max_ctx_len),
         validate_block_table=False,
+        batch_invariant=self.batch_invariant,
     )
     selected = select_qsa_paged_tokens(
         block_logits,
@@ -698,13 +701,14 @@ def _incremental_prefill_selection(
         compress_ratio=int(plan.ratio),
         token_budget=int(plan.token_budget),
         validate_lengths=False,
+        batch_invariant=self.batch_invariant,
     )
     return selected.index_select(
         0, torch.tensor(valid_rows, dtype=torch.int64, device=q.device)
     )
 
 
-def _select_prefix_prefill_chunks(q, weights, plan):
+def _select_prefix_prefill_chunks(q, weights, plan, *, batch_invariant=False):
     """Bound score storage without padding the batch to its longest request."""
     from rtp_llm.models_py.kernels.cuda.qsa.indexer_paged_score import (
         qsa_paged_indexer_score,
@@ -713,7 +717,9 @@ def _select_prefix_prefill_chunks(q, weights, plan):
     columns = int(plan.max_ctx_len)
     chunk_rows = max(1, _MAX_SCORE_WORKSPACE_BYTES // max(1, columns * 4))
     # Preserve the MMA producer used by a long batch even for a short tail.
-    minimum_rows = min(16, chunk_rows) if max(plan.lengths) >= 16 else 1
+    minimum_rows = (
+        min(16, chunk_rows) if not batch_invariant and max(plan.lengths) >= 16 else 1
+    )
     output = torch.empty(
         (q.shape[0], int(plan.token_budget) + int(plan.ratio) - 1),
         dtype=torch.int32,
@@ -746,6 +752,7 @@ def _select_prefix_prefill_chunks(q, weights, plan):
                 block_size=int(plan.kv_entries_per_block),
                 max_ctx_len=columns,
                 validate_block_table=False,
+                batch_invariant=batch_invariant,
             )
             selected = select_qsa_paged_tokens(
                 logits[:rows],
@@ -754,6 +761,7 @@ def _select_prefix_prefill_chunks(q, weights, plan):
                 token_budget=int(plan.token_budget),
                 validate_lengths=False,
                 scores_are_masked=True,
+                batch_invariant=batch_invariant,
             )
             output[offset + start : offset + end].copy_(selected)
             del logits, selected

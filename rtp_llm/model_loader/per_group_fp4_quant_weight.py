@@ -589,6 +589,8 @@ class PerGroupFp4Weight(CompositeWeight, QuantWeight):
         load_config: LoadConfig,
     ):
         processed_res = super()._postprocess(tensor, device, load_config)
+        if load_config.batch_invariant:
+            return processed_res
         kernel_weight = processed_res[self.kernel.name]
         if self.scale is not None:
             scale_weight = processed_res[self.scale.name]

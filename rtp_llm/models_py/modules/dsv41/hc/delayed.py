@@ -45,8 +45,9 @@ def collapse_delayed(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
 
 
 class DelayedHCUnit(HCUnitBase):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, batch_invariant: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.batch_invariant = batch_invariant
         mix_width = self.hc_mult * (self.hc_mult + 2)
         expected_fn_shape = (mix_width, self.hc_mult * self.dim)
         if tuple(self.fn.shape) != expected_fn_shape:
@@ -72,7 +73,10 @@ class DelayedHCUnit(HCUnitBase):
     def _pre_impl(self, x: torch.Tensor, dbg_tag=None):
         shape = x.shape
         if x.is_cuda and x.dtype == torch.bfloat16:
-            from rtp_llm.models_py.modules.dsv41.hc.v41_prenorm import prenorm
+            if self.batch_invariant:
+                from rtp_llm.models_py.modules.dsv4.hc.batch_invariant import prenorm
+            else:
+                from rtp_llm.models_py.modules.dsv41.hc.v41_prenorm import prenorm
 
             ops = _tile_ops()
             residual = x.reshape(1, -1, self.hc_mult, self.dim)

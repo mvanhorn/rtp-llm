@@ -343,6 +343,8 @@ def _args_from_model_config(
 class DeepSeekV4Model(GptModelBase):
     """Framework-facing model: owns a V4Transformer, feeds framework IO into it."""
 
+    supports_batch_invariant = True
+
     # Whether this model captures aux hidden features for DSpARK. The draft
     # carries the capture ids too (for the shared-buffer row-width
     # derivation) but never captures; DeepSeekV4DSparkModel overrides this.
@@ -373,6 +375,7 @@ class DeepSeekV4Model(GptModelBase):
             max_generate_batch_size,
             moe_config=moe_config,
         )
+        args.hw_kernel_config = py_hw_kernel_config
         self._max_generate_batch_size = int(max_generate_batch_size)
         assert self._max_generate_batch_size > 0, (
             "max_generate_batch_size must be positive, "

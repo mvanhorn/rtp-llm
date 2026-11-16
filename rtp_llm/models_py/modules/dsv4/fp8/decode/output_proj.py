@@ -82,7 +82,12 @@ def decode_output_proj(
     if attn.tp_size > 1:
         from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 
-        reduced = all_reduce(out, Group.TP, inplace=True)
+        reduced = all_reduce(
+            out,
+            Group.TP,
+            inplace=True,
+            **({"batch_invariant": True} if attn.batch_invariant else {}),
+        )
         if reduced is not out:
             out.copy_(reduced)
     return out

@@ -28,7 +28,8 @@ class MMRemoteEmbeddingCache:
         max_inflight_bytes,
         max_pending=8,
         read_timeout_ms=200,
-        cuda_device=None
+        cuda_device=None,
+        key_prefix="",
     ):
         if min(max_object_bytes, max_inflight_bytes, max_pending, read_timeout_ms) <= 0:
             raise ValueError("remote embedding cache limits must be positive")
@@ -38,6 +39,7 @@ class MMRemoteEmbeddingCache:
         self.max_pending = max_pending
         self.read_timeout_ms = read_timeout_ms
         self.cuda_device = cuda_device
+        self.key_prefix = key_prefix
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="mm-remote-cache"
         )
@@ -80,6 +82,7 @@ class MMRemoteEmbeddingCache:
         """Called after CPU storage detachment; never copies or does network I/O."""
         if entry.pool_owners or entry.result is None or entry.error is not None:
             return
+        key = self.key_prefix + key
         try:
             plan = plan_object(
                 entry.result,
@@ -125,6 +128,7 @@ class MMRemoteEmbeddingCache:
         future.add_done_callback(done)
 
     def load(self, key, *, timeout_ms=None):
+        key = self.key_prefix + key
         timeout_ms = min(self.read_timeout_ms, timeout_ms or self.read_timeout_ms)
         deadline = time.monotonic() + timeout_ms / 1000
         # Admission also bounds metadata probes. Grow the reservation only

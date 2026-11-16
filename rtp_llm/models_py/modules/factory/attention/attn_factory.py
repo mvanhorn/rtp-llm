@@ -361,6 +361,38 @@ class AttnImplFactory(object):
         )
         attn_inputs.headwise_config = getattr(model_config, "headwise_config", None)
         if batch_invariant:
+            attn_inputs.is_cuda_graph = is_cuda_graph
+            if attn_configs.use_mla:
+                from .cuda_mla_impl.batch_invariant import BatchInvariantMlaAttention
+
+                if not BatchInvariantMlaAttention.support(
+                    attn_configs, attn_inputs
+                ) or not BatchInvariantMlaAttention.support_parallelism_config(
+                    parallelism_config
+                ):
+                    raise ValueError(
+                        "RTP_BATCH_INVARIANT does not support this MLA configuration"
+                    )
+                return BatchInvariantMlaAttention(
+                    attn_configs,
+                    attn_inputs,
+                    weight.weights,
+                    weight.get_global_weight_or_none(W.rope_cos_sin_cache),
+                    is_cuda_graph=is_cuda_graph,
+                    parallelism_config=parallelism_config,
+                )
+            if _select_attention_impl_key(attn_configs) == "sparse_gqa":
+                from rtp_llm.models_py.modules.qwen4_exp.qsa.sparse_gqa_impl import (
+                    SparseGqaFmhaImpl,
+                )
+
+                return SparseGqaFmhaImpl(
+                    attn_configs,
+                    attn_inputs,
+                    parallelism_config,
+                    batch_invariant=True,
+                    batch_invariant_rope_cache=batch_invariant_rope_cache,
+                )
             from .cuda_impl.batch_invariant import BatchInvariantAttention
 
             if not BatchInvariantAttention.support(
@@ -371,9 +403,14 @@ class AttnImplFactory(object):
                 raise ValueError(
                     "RTP_BATCH_INVARIANT does not support this attention configuration"
                 )
-            attn_inputs.is_cuda_graph = is_cuda_graph
+            slopes = None
+            if getattr(model_config, "use_attention_linear_bias", False):
+                slopes = weight.get_global_weight_or_none(W.linear_bias_slopes)
+                if slopes is None or slopes.shape != (attn_configs.head_num,):
+                    raise ValueError("RTP_BATCH_INVARIANT requires local ALiBi slopes")
+                slopes = slopes.contiguous()
             return BatchInvariantAttention(
-                attn_configs, attn_inputs, batch_invariant_rope_cache
+                attn_configs, attn_inputs, batch_invariant_rope_cache, slopes
             )
 
         if (

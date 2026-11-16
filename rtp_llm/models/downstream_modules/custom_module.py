@@ -51,10 +51,27 @@ class CustomModule(object):
 
 
 class CustomHandler(object):
+    supports_batch_invariant = False
+    batch_invariant = False
+
     def __init__(self, config: ModelConfig):
         self.config_ = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.need_post_process = False
+
+    def enable_batch_invariant(self) -> None:
+        if not self.supports_batch_invariant:
+            raise ValueError(
+                f"RTP_BATCH_INVARIANT does not support {type(self).__name__}"
+            )
+        self.batch_invariant = True
+
+    def project(self, layer: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        if self.batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant import linear
+
+            return linear(x, layer.weight, layer.bias)
+        return layer(x)
 
     def custom_weight_info(self) -> List[CustomAtomicWeight]:
         return []

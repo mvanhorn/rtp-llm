@@ -181,7 +181,6 @@ class MixedFp4Weight(CompositeWeight, QuantWeight):
             return False
         return not _is_fp4_weight_excluded(quant_config, src_weight_info)
 
-
     def __init__(
         self,
         src_weight_info: WeightModule,
@@ -663,6 +662,8 @@ class MixedFp4Weight(CompositeWeight, QuantWeight):
         load_config: LoadConfig,
     ):
         processed_res = super()._postprocess(tensor, device, load_config)
+        if load_config.batch_invariant:
+            return processed_res
         kernel_weight = processed_res[self.kernel.name]
         if self.scale is not None:
             scale_weight = processed_res[self.scale.name]

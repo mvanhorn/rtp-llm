@@ -145,6 +145,7 @@ TEST_F(PPSerializationTest, ExecutionResultDecodingOwnsPinnedCpuRequestOutputs) 
     result.request_errors.resize(1);
     result.request_outputs.resize(1);
     result.request_outputs[0].hidden_states = torch::arange(8, torch::kFloat32).reshape({2, 4});
+    result.request_outputs[0].raw_logprobs  = torch::tensor({-0.625f, -2.5f}).reshape({2, 1});
     PromptLogitsOutput prompt_logits;
     prompt_logits.topk_token_ids            = torch::tensor({{2, 3}}, torch::kInt32);
     prompt_logits.topk_logprobs             = torch::tensor({{-0.2f, -1.7f}});
@@ -164,6 +165,9 @@ TEST_F(PPSerializationTest, ExecutionResultDecodingOwnsPinnedCpuRequestOutputs) 
               result.request_outputs[0].hidden_states.sizes().vec());
     EXPECT_TRUE(torch::equal(received.request_outputs[0].hidden_states, result.request_outputs[0].hidden_states));
     EXPECT_NE(received.request_outputs[0].hidden_states.data_ptr(), result.request_outputs[0].hidden_states.data_ptr());
+    EXPECT_TRUE(received.request_outputs[0].raw_logprobs.is_pinned());
+    EXPECT_EQ(received.request_outputs[0].raw_logprobs.scalar_type(), torch::kFloat32);
+    EXPECT_TRUE(torch::equal(received.request_outputs[0].raw_logprobs, result.request_outputs[0].raw_logprobs));
     ASSERT_EQ(received.request_outputs.size(), 1u);
     ASSERT_TRUE(received.request_outputs.front().prompt_logits.has_value());
     EXPECT_TRUE(received.request_outputs.front().prompt_logits->topk_token_ids.is_cpu());

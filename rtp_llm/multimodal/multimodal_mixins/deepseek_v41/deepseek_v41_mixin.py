@@ -26,6 +26,8 @@ class V41MixinLoader(MultimodalMixinLoader):
 
 
 class DeepSeekV41Mixin(BaseMultiModalMixin):
+    supports_batch_invariant = True
+
     @classmethod
     def _get_mm_module(cls, mm_related_params, vit_config):
         config = mm_related_params.config["v41_config"]

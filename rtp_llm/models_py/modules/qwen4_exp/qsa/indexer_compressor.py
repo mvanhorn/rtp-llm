@@ -149,6 +149,7 @@ def _write_indexer_cache_vectorized(
     capture_undo: bool,
     rope_is_token_aligned: bool,
     is_s_padded: bool = False,
+    batch_invariant: bool = False,
 ) -> dict:
     """Device-vectorized writer used by the production CUDA path.
 
@@ -355,8 +356,6 @@ def _write_indexer_cache_vectorized(
         )
         kv_slots[completed_indices[kv_write_valid]] = completed_kv_slots[kv_write_valid]
 
-        pooled = gathered.mean(dim=1).to(raw_keys.dtype)
-        pooled = exact_head_rms_norm(pooled, k_norm_gamma, norm_eps)
         if rope_is_token_aligned:
             cos = rope_cos.index_select(0, completed_indices)
             sin = rope_sin.index_select(0, completed_indices)
@@ -366,7 +365,16 @@ def _write_indexer_cache_vectorized(
         else:
             cos = rope_cos[completed_requests, block_starts]
             sin = rope_sin[completed_requests, block_starts]
-        pooled = apply_partial_rope(pooled, cos, sin).to(torch.bfloat16)
+        if batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.qsa.indexer_decode import (
+                compress_prefill_keys,
+            )
+
+            pooled = compress_prefill_keys(gathered, cos, sin, k_norm_gamma, norm_eps)
+        else:
+            pooled = gathered.mean(dim=1).to(raw_keys.dtype)
+            pooled = exact_head_rms_norm(pooled, k_norm_gamma, norm_eps)
+            pooled = apply_partial_rope(pooled, cos, sin).to(torch.bfloat16)
         kv_write_slots = completed_kv_slots[kv_write_valid]
         kv_write_values = pooled[kv_write_valid]
 
@@ -435,6 +443,7 @@ def write_indexer_cache(
     capture_undo: bool = False,
     rope_is_token_aligned: bool = False,
     is_s_padded: bool = False,
+    batch_invariant: bool = False,
 ) -> dict:
     """Write ragged raw indexer keys to the state ring and completed means to KV.
 
@@ -568,6 +577,7 @@ def write_indexer_cache(
             capture_undo=capture_undo,
             rope_is_token_aligned=rope_is_token_aligned,
             is_s_padded=is_s_padded,
+            batch_invariant=batch_invariant,
         )
 
     offsets = [int(v) for v in cu_seqlens.tolist()]

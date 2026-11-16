@@ -549,6 +549,10 @@ bool GenerateStream::isMiddleChunk() const {
 void GenerateStream::advanceChunk() {
     reuse_length_ += currentChunkLen();
     chunk_advanced_ = true;
+    RTP_LLM_LOG_DEBUG("[chunked_prefill] stream %ld advanced to %d of %d tokens",
+                      streamId(),
+                      reuse_length_,
+                      seqLength());
 }
 
 int GenerateStream::nextChunkBoundaryToken() const {

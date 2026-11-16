@@ -14,6 +14,25 @@ py_test(
     exec_properties = {"gpu": "L20_CU13"},
 )
 
+py_test(
+    name = "batch_invariant_encoder_test",
+    srcs = ["batch_invariant_encoder_test.py"],
+    deps = py_test_deps + ["//rtp_llm/models_py:kernels"],
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+)
+
+py_test(
+    name = "batch_invariant_mla_test",
+    srcs = ["batch_invariant_mla_test.py"],
+    deps = py_test_deps + [
+        "//rtp_llm/models_py:kernels",
+        "//rtp_llm/models_py/triton_kernels",
+    ],
+    tags = ["L20_CU13"],
+    exec_properties = {"gpu": "L20_CU13"},
+)
+
 py_test (
     name = "per_token_group_quant_8bit_test",
     srcs = ["per_token_group_quant_8bit_test.py"],

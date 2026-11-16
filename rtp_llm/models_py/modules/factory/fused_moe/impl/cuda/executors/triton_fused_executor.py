@@ -62,25 +62,83 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         # w1: [E, 2*inter_size, hidden_size], w2: [E, hidden_size, inter_size]
         self.w1 = weights[W.moe_w1]
         self.w2 = weights[W.moe_w2]
+        self.nvfp4 = batch_invariant and quant_config.quant_dtype == torch.uint8
+        self.mxfp4 = batch_invariant and quant_config.quant_dtype == torch.int8
+        self.mxfp4_activation_group_size = (
+            32 if getattr(config, "model_type", "") == "deepseek_v41" else 128
+        )
+        self.fp8_per_tensor = (
+            batch_invariant
+            and quant_config.quant_dtype == torch.float8_e4m3fn
+            and not quant_config.is_block_quantized
+        )
         self.w1_scale = (
             weights[W.moe_s1]
-            if batch_invariant and quant_config.is_block_quantized
+            if batch_invariant
+            and (quant_config.is_block_quantized or self.fp8_per_tensor)
             else None
         )
         self.w2_scale = weights[W.moe_s2] if self.w1_scale is not None else None
         if batch_invariant and (
-            self.w1.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+            self.w1.dtype
+            not in (
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.uint8,
+                torch.int8,
+            )
             or self.w2.dtype != self.w1.dtype
-            or (self.w1.dtype == torch.float8_e4m3fn) != (self.w1_scale is not None)
+            or (self.w1.dtype == torch.uint8) != self.nvfp4
+            or (self.w1.dtype == torch.int8) != self.mxfp4
+            or (self.w1.dtype in (torch.float8_e4m3fn, torch.uint8, torch.int8))
+            != (self.w1_scale is not None)
         ):
             raise ValueError(
-                "RTP_BATCH_INVARIANT requires FP16, BF16 or block FP8 experts"
+                "RTP_BATCH_INVARIANT requires FP16, BF16, FP8, NVFP4 or MXFP4 experts"
             )
+        self.nvfp4_scales = ()
+        self.fp8_input_scales = ()
+        if self.fp8_per_tensor:
+            self.w1_scale = self.w1_scale.reshape(self.w1.size(0), 1, 1)
+            self.w2_scale = self.w2_scale.reshape(self.w2.size(0), 1, 1)
+            self.fp8_input_scales = (
+                weights.get(W.moe_w1_input_sr),
+                weights.get(W.moe_w2_input_sr),
+            )
+            if any(
+                scale is not None and scale.numel() != 1
+                for scale in self.fp8_input_scales
+            ):
+                raise ValueError(
+                    "batch-invariant per-tensor FP8 requires scalar input scales"
+                )
+        if self.nvfp4:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant_nvfp4 import (
+                validate_nvfp4_weight,
+            )
+
+            self.nvfp4_scales = (
+                (weights[W.moe_w1_i_s].contiguous(), weights[W.moe_w1_s2].contiguous()),
+                (weights[W.moe_w2_i_s].contiguous(), weights[W.moe_w2_s2].contiguous()),
+            )
+            for weight, scale, (input_scale, weight_scale) in zip(
+                (self.w1, self.w2), (self.w1_scale, self.w2_scale), self.nvfp4_scales
+            ):
+                validate_nvfp4_weight(weight, scale, weight_scale, input_scale)
+        if self.mxfp4:
+            self.w1_scale = self._mxfp4_weight_scales(self.w1, self.w1_scale)
+            self.w2_scale = self._mxfp4_weight_scales(self.w2, self.w2_scale)
         self.E = self.w1.size(0)
         self.N = self.w1.size(1)  # 2 * inter_size
-        self.K = self.w1.size(2)  # hidden_size
+        self.K = self.w1.size(2) * (2 if self.nvfp4 or self.mxfp4 else 1)  # hidden_size
         self.inter_size = self.N // 2
-        if self.w1_scale is not None and (self.K % 128 or self.inter_size % 128):
+        if (
+            batch_invariant
+            and quant_config.is_block_quantized
+            and not (self.nvfp4 or self.mxfp4)
+            and (self.K % 128 or self.inter_size % 128)
+        ):
             raise ValueError(
                 "batch-invariant block FP8 experts require K divisible by 128"
             )
@@ -98,13 +156,47 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
     def topk_ids_dtype(self) -> torch.dtype:
         return torch.int32
 
+    @staticmethod
+    def _mxfp4_weight_scales(weight, scales):
+        if scales.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise ValueError("batch-invariant MXFP4 requires UE8M0 expert scales")
+        if scales.shape != (*weight.shape[:-1], weight.size(-1) // 16):
+            raise ValueError("batch-invariant MXFP4 requires row-major group-32 scales")
+        return scales.view(torch.uint8)
+
     def _quantize_expert_input(
-        self, x: torch.Tensor, weight_scales: torch.Tensor | None
+        self, x: torch.Tensor, weight_scales: torch.Tensor | None, projection: int
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if weight_scales is None:
             return x, {}
+        if self.nvfp4:
+            input_scale, weight_scale = self.nvfp4_scales[projection]
+            return x, {
+                "B_scale": weight_scales,
+                "nvfp4_input_scale": input_scale,
+                "nvfp4_weight_scale": weight_scale,
+            }
+        if self.fp8_per_tensor:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant import quantize_fp8_rows
+
+            quantized, scales = quantize_fp8_rows(x, self.fp8_input_scales[projection])
+            return quantized, {
+                "A_scale": scales,
+                "B_scale": weight_scales,
+                "per_tensor_fp8": True,
+            }
         from rtp_llm.models_py.kernels.cuda.batch_invariant import quantize_fp8_blocks
 
+        if self.mxfp4:
+            group_size = self.mxfp4_activation_group_size
+            eps = torch.finfo(torch.float32).tiny if group_size == 32 else 1e-4
+            quantized, scales = quantize_fp8_blocks(x, True, group_size, eps=eps)
+            return quantized, {
+                "A_scale": scales,
+                "B_scale": weight_scales,
+                "mxfp4": True,
+                "mxfp4_activation_group_size": group_size,
+            }
         packed = weight_scales.dtype == torch.int32
         quantized, scales = quantize_fp8_blocks(x, packed)
         return quantized, {
@@ -166,7 +258,12 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
             config1 = config2 = {
                 "BLOCK_SIZE_M": 16,
                 "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 128 if self.w1_scale is not None else 32,
+                "BLOCK_SIZE_K": (
+                    128
+                    if self.quant_config.is_block_quantized
+                    and not (self.nvfp4 or self.mxfp4)
+                    else 32
+                ),
                 "GROUP_SIZE_M": 1,
                 "num_warps": 4,
             }
@@ -217,7 +314,7 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         # GEMM1: hidden_states @ w1.T → intermediate1 [M*top_k, 2*inter]
         intermediate1 = torch.empty(M * top_k, self.N, device=device, dtype=dtype)
         expert_input, scale_options = self._quantize_expert_input(
-            hidden_states, self.w1_scale
+            hidden_states, self.w1_scale, 0
         )
         invoke_fused_moe_kernel(
             expert_input,
@@ -239,12 +336,20 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         intermediate2 = torch.empty(
             M * top_k, self.inter_size, device=device, dtype=dtype
         )
-        silu_and_mul(intermediate2, intermediate1)
+        if self.batch_invariant:
+            silu_and_mul(
+                intermediate2,
+                intermediate1,
+                gate_first=getattr(self.config, "moe_w1_layout", "") == "gate_up",
+                clamp_limit=getattr(self.config, "swiglu_limit", 0.0),
+            )
+        else:
+            silu_and_mul(intermediate2, intermediate1)
 
         # GEMM2: intermediate2 @ w2.T → out [M*top_k, K]
         out = torch.empty(M * top_k, K, device=device, dtype=dtype)
         expert_input, scale_options = self._quantize_expert_input(
-            intermediate2, self.w2_scale
+            intermediate2, self.w2_scale, 1
         )
         invoke_fused_moe_kernel(
             expert_input,

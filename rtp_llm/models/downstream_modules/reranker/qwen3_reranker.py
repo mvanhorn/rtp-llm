@@ -100,10 +100,9 @@ class Qwen3RerankerRenderer(RerankerRenderer):
 
 
 class Qwen3RerankerHandler(CustomHandler):
+    supports_batch_invariant = True
 
-    def __init__(
-        self, config: ModelConfig, token_false_id: int, token_true_id: int
-    ):
+    def __init__(self, config: ModelConfig, token_false_id: int, token_true_id: int):
         super().__init__(config)
         self.token_false_id = token_false_id
         self.token_true_id = token_true_id
@@ -113,7 +112,7 @@ class Qwen3RerankerHandler(CustomHandler):
             if self.tie_word_embeddings
             else "lm_head.weight"
         )
-        
+
     def custom_weight_info(self) -> List[CustomAtomicWeight]:
         w_list = [self.lm_head_weight_name]
         weights = []
@@ -129,6 +128,11 @@ class Qwen3RerankerHandler(CustomHandler):
         self.linear = torch.nn.Linear(linear_weight.shape[1], linear_weight.shape[0])
         self.linear.weight.data = linear_weight
         self.linear = self.linear.to(data_type).eval().to(self.device)
+        if self.batch_invariant:
+            rank_tokens = [self.token_false_id, self.token_true_id]
+            self.rank_weight = self.linear.weight[rank_tokens].detach()
+            self.rank_bias = self.linear.bias[rank_tokens].detach()
+            del self.linear
 
     @torch.inference_mode()
     def forward(
@@ -138,10 +142,15 @@ class Qwen3RerankerHandler(CustomHandler):
         input_lengths: torch.Tensor,
     ) -> torch.Tensor:
         last_token = get_last_token_from_combo_tokens(hidden_states, input_lengths)
-        last_token_logits = self.linear(last_token)
-        true_vector = last_token_logits[:, self.token_true_id]
-        false_vector = last_token_logits[:, self.token_false_id]
-        batch_scores = torch.stack([false_vector, true_vector], dim=1)
+        if self.batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant import linear
+
+            batch_scores = linear(last_token, self.rank_weight, self.rank_bias)
+        else:
+            last_token_logits = self.linear(last_token)
+            true_vector = last_token_logits[:, self.token_true_id]
+            false_vector = last_token_logits[:, self.token_false_id]
+            batch_scores = torch.stack([false_vector, true_vector], dim=1)
         batch_scores = torch.nn.functional.log_softmax(batch_scores, dim=1)
         scores = batch_scores[:, 1].exp()
         return scores

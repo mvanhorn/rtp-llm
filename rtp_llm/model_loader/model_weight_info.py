@@ -204,6 +204,7 @@ class ModelDeployWeightInfo:
         self.role_type = getattr(parallelism_config, "role_type", None)
 
         self._use_swizzleA = hw_kernel_config.use_swizzleA
+        self._batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
         self._use_qk_norm = model_config.qk_norm
         self._hidden_size = model_config.hidden_size
         # inter_size is now accessed from model config when needed, not stored
@@ -809,6 +810,7 @@ class ModelDeployWeightInfo:
             phy2log=phy2log,  # phy2log should be set before create_load_config is called
             exported_device=exported_device,
             use_swizzleA=self._use_swizzleA,
+            batch_invariant=self._batch_invariant,
             force_cpu_load_weights=force_cpu_load_weights,
             moe_pure_tp_preshard=moe_pure_tp_preshard,
         )

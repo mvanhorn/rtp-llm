@@ -24,7 +24,16 @@ class MultimodalMixinFactory:
             logging.info("No multimodal model, skip create multimodal mixin")
             return None
         multimodal_mixin_cls = get_multimodal_mixin_cls(model_config.model_type)
-        return multimodal_mixin_cls(
+        batch_invariant = getattr(
+            getattr(engine_config, "hw_kernel_config", None), "batch_invariant", False
+        )
+        if batch_invariant and not getattr(
+            multimodal_mixin_cls, "supports_batch_invariant", False
+        ):
+            raise ValueError(
+                f"RTP_BATCH_INVARIANT does not support {model_config.model_type} vision"
+            )
+        mixin = multimodal_mixin_cls(
             model_config.compute_dtype,
             device,
             model_config.mm_related_params,
@@ -32,6 +41,9 @@ class MultimodalMixinFactory:
             vit_config,
             model_config.ckpt_path,
         )
+        if batch_invariant:
+            mixin.enable_batch_invariant()
+        return mixin
 
     @staticmethod
     def create_multimodal_process_engine(

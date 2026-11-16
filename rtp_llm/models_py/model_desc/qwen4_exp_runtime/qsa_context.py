@@ -54,6 +54,7 @@ class Qwen4ExpQSARuntimeContext:
     metadata_cache: dict | None = field(default=None, repr=False, compare=False)
     position_state_cache: LayerKVCache | None = None
     position_state_inputs: PyAttentionInputs | None = None
+    batch_invariant: bool = False
     _position_state: Any = field(default=None, init=False, repr=False, compare=False)
     _side_cache_undo: IndexerCacheUndo | None = field(
         default=None, init=False, repr=False, compare=False
@@ -96,6 +97,7 @@ class Qwen4ExpQSARuntimeContext:
             **kwargs,
             capture_undo=True,
             is_s_padded=bool(self.main_inputs.is_s_padded),
+            **({"batch_invariant": True} if self.batch_invariant else {}),
         )
         undo = result.pop("undo", None)
         if not isinstance(undo, IndexerCacheUndo):

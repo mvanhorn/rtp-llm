@@ -59,6 +59,8 @@ class ClassifierRenderer(CustomRenderer):
 
 
 class ClassifierHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         num_labels = load_num_labels(self.config_.ckpt_path)
@@ -89,9 +91,9 @@ class ClassifierHandler(CustomHandler):
         # TODO test it
         if self.config_.attn_config.is_causal:
             last_tokens = get_last_token_from_combo_tokens(hidden_states, input_lengths)
-            return self.linear(last_tokens)
+            return self.project(self.linear, last_tokens)
         else:
             first_tokens = get_first_token_from_combo_tokens(
                 hidden_states, input_lengths
             )
-            return self.linear(first_tokens)
+            return self.project(self.linear, first_tokens)

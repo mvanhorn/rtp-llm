@@ -87,6 +87,8 @@ class SparseEmbeddingRenderer(EmbeddingRendererBase):
 
 
 class SparseEmbeddingHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.sparse_linear = torch.nn.Linear(
@@ -113,5 +115,6 @@ class SparseEmbeddingHandler(CustomHandler):
         hidden_states: torch.Tensor,
         input_lengths: torch.Tensor,
     ):
-        hidden_states = torch.relu(self.sparse_linear(hidden_states)).squeeze_(-1)
+        hidden_states = torch.relu(self.project(self.sparse_linear, hidden_states))
+        hidden_states = hidden_states.squeeze_(-1)
         return hidden_combo_to_batch(hidden_states, input_lengths)

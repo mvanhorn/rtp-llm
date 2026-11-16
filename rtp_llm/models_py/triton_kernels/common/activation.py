@@ -17,6 +17,8 @@ def _silu_and_mul_kernel(
     output_row_stride: tl.int32,
     # Meta-parameter for tuning
     BLOCK_SIZE_N: tl.constexpr,
+    GATE_FIRST: tl.constexpr = False,
+    CLAMP_LIMIT: tl.constexpr = 0.0,
 ):
     pid_b = tl.program_id(axis=0)  # Batch dimension
     pid_n_block = tl.program_id(axis=1)  # N-dimension block
@@ -31,9 +33,14 @@ def _silu_and_mul_kernel(
     output_ptrs = output_row_start_ptr + n_offsets
 
     mask = n_offsets < N
+    if GATE_FIRST:
+        gate_ptrs, value_ptrs = value_ptrs, gate_ptrs
     gate = tl.load(gate_ptrs, mask=mask)
     value = tl.load(value_ptrs, mask=mask)
 
+    if CLAMP_LIMIT > 0:
+        gate = tl.minimum(gate.to(tl.float32), CLAMP_LIMIT)
+        value = tl.clamp(value.to(tl.float32), -CLAMP_LIMIT, CLAMP_LIMIT)
     silu_gate = gate * tl.sigmoid(gate.to(tl.float32))
     output = silu_gate * value
 
@@ -41,7 +48,11 @@ def _silu_and_mul_kernel(
 
 
 def silu_and_mul(
-    output_tensor: torch.Tensor, input_tensor: torch.Tensor
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    *,
+    gate_first: bool = False,
+    clamp_limit: float = 0.0,
 ) -> torch.Tensor:
     """
     Computes SiLU(gate) * value in a fused Triton kernel.
@@ -64,6 +75,8 @@ def silu_and_mul(
         input_tensor.stride(0),
         output_tensor.stride(0),
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        GATE_FIRST=gate_first,
+        CLAMP_LIMIT=clamp_limit,
     )
     return output_tensor
 

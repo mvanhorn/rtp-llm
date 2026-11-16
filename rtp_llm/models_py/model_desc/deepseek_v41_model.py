@@ -42,6 +42,8 @@ def configure_v41(model, model_config) -> None:
 
 
 class DeepSeekV41Model(DeepSeekV4Model):
+    supports_batch_invariant = False
+
     def __init__(self, model_config, *args, **kwargs) -> None:
         super().__init__(model_config, *args, **kwargs)
         configure_v41(self, model_config)
@@ -74,7 +76,11 @@ class DeepSeekV41Model(DeepSeekV4Model):
                 continue
             layer = self.v4.layers[layer_id]
             layer.engram = Engram.from_checkpoint(
-                config, layer_id, checkpoint_path, device
+                config,
+                layer_id,
+                checkpoint_path,
+                device,
+                **({"batch_invariant": True} if self.batch_invariant else {}),
             )
             modules.append((layer_id, layout.layer_ids.index(layer_id)))
         self._engram_layers = tuple(modules)

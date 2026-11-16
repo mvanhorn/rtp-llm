@@ -10,6 +10,8 @@ from rtp_llm.ops import ActivationType
 
 class Qwen4DenseMLP(DenseMLP):
     def forward(self, x: torch.Tensor, skip_allreduce: bool = False) -> torch.Tensor:
+        if self.batch_invariant:
+            return super().forward(x, skip_allreduce=skip_allreduce)
         fused_down = None
         if not self.is_gated and self.activation_type == ActivationType.Gelu:
             activated = self.up_proj.forward_with_bias_gelu(x)

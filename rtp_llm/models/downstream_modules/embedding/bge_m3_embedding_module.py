@@ -76,6 +76,8 @@ class BgeM3EmbeddingModule(CustomModule):
 
 
 class BgeM3EmbeddingHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(
         self,
         dense: SentenceTransformerHandler,
@@ -99,6 +101,11 @@ class BgeM3EmbeddingHandler(CustomHandler):
         self.dense_handler.init(tensor_map)
         self.sparse_handler.init(tensor_map)
         self.colbert_handler.init(tensor_map)
+
+    def enable_batch_invariant(self) -> None:
+        super().enable_batch_invariant()
+        for handler in (self.dense_handler, self.sparse_handler, self.colbert_handler):
+            handler.enable_batch_invariant()
 
     def _get_embedding_type(
         self,
@@ -137,7 +144,7 @@ class BgeM3EmbeddingHandler(CustomHandler):
         **combo_data: Any,
     ) -> List[Dict[str, torch.Tensor]]:
         input_lengths: torch.Tensor = combo_data["input_lengths"]
-        batch_data = combo_to_batch_data(input_lengths, **combo_data)
+        batch_data = combo_to_batch_data(input_lengths, combo_data)
 
         dense_res = self.dense_handler.extend_forward_internal(batch_data)
         colbert_res = self.colbert_handler.forward_internal(

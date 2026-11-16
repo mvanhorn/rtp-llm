@@ -221,6 +221,7 @@ def select_target_verify_tokens(
         block_size=int(plan.kv_entries_per_block),
         validate_block_table=False,
         max_ctx_len=int(plan.max_ctx_len),
+        batch_invariant=self.batch_invariant,
     )
     return select_qsa_paged_tokens(
         block_logits,
@@ -229,4 +230,5 @@ def select_target_verify_tokens(
         token_budget=token_budget,
         validate_lengths=False,
         scores_are_masked=True,
+        batch_invariant=self.batch_invariant,
     )

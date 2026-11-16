@@ -28,7 +28,10 @@ class Qwen4MoeLayer(GenericMoeLayer):
 
     def __init__(self, config, parallelism_config, weights, *args, **kwargs):
         super().__init__(config, parallelism_config, weights, *args, **kwargs)
-        if os.getenv("RTP_QWEN4_BF16_SHARED_TP2", "0") == "1":
+        batch_invariant = getattr(
+            kwargs.get("hw_kernel_config"), "batch_invariant", False
+        )
+        if not batch_invariant and os.getenv("RTP_QWEN4_BF16_SHARED_TP2", "0") == "1":
             from rtp_llm.models_py.modules.qwen4_exp.moe.shared_tp2 import (
                 maybe_prepare_bf16_shared_tp2,
             )

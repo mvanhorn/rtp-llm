@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest import TestCase, main
+from unittest import TestCase, main, skipUnless
 from unittest.mock import Mock, patch
 
 import torch
@@ -79,6 +79,22 @@ class Qwen3VLEmbeddingTest(TestCase):
         for actual, expected in zip(batched, singles):
             for actual_tensor, expected_tensor in zip(actual, expected):
                 torch.testing.assert_close(actual_tensor, expected_tensor)
+
+    @skipUnless(
+        torch.cuda.is_available() and torch.version.hip is None,
+        "requires an NVIDIA GPU",
+    )
+    def test_batch_invariant_vision_embeddings(self):
+        self.embedding.visual.to(device="cuda", dtype=torch.bfloat16)
+        self.embedding.enable_batch_invariant()
+        target, longer = self.media(4, 4), self.media(4, 6)
+        baseline = self.embedding.embedding(target)
+        for data, row in (([target, longer], 0), ([longer, target], 1)):
+            actual = self.embedding.batched_embedding(
+                data, [MMUrlType.IMAGE, MMUrlType.IMAGE]
+            )[row]
+            for tensor, expected in zip(actual, baseline):
+                self.assertTrue(torch.equal(tensor, expected))
 
 
 if __name__ == "__main__":

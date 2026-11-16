@@ -79,7 +79,12 @@ class BaseMultiModalDeployWeightInfo(ModelDeployWeightInfo):
 
 
 class BaseMultiModalMixin:
+    supports_batch_invariant = False
     mm_part: MultiModalEmbeddingInterface
+
+    def enable_batch_invariant(self) -> None:
+        # The default embedding interface runs the vision model per media item.
+        self.mm_part.batch_invariant = True
 
     def __init__(
         self,

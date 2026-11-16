@@ -71,8 +71,21 @@ def _ple_gate(
 
 
 def try_ple_gate(
-    key, value, hidden, norm_key, norm_query, norm_conv, eps, projection_scales=None
+    key,
+    value,
+    hidden,
+    norm_key,
+    norm_query,
+    norm_conv,
+    eps,
+    projection_scales=None,
+    *,
+    batch_invariant=False,
 ):
+    if hidden.ndim != 3 or value.ndim != 3:
+        return None
+    width = hidden.shape[-1]
+    hidden_size = value.shape[-1]
     projected = projection_scales is not None
     if projected and not (
         hidden.shape[0] == 1
@@ -89,20 +102,31 @@ def try_ple_gate(
     if not (
         hidden.is_cuda
         and torch.version.hip is None
-        and torch.cuda.get_device_capability(hidden.device) == (12, 0)
-        and hidden.ndim == 3
+        and (
+            (
+                batch_invariant
+                and not projected
+                and 0 < hidden_size <= 4096
+                and width % hidden_size == 0
+            )
+            or (
+                not batch_invariant
+                and torch.cuda.get_device_capability(hidden.device) == (12, 0)
+                and width == 10240
+                and hidden_size == 2560
+            )
+        )
         and (
             hidden.shape[0] == 1 or all(x.is_contiguous() for x in (key, value, hidden))
         )
         and hidden.dtype == torch.bfloat16
         and key.dtype == value.dtype == (torch.float32 if projected else torch.bfloat16)
-        and hidden.shape[-1] == key.shape[-1] == 10240
-        and value.shape[-1] == 2560
+        and key.shape[-1] == width
         and key.shape[:-1] == value.shape[:-1] == hidden.shape[:-1]
         and all(x.device == hidden.device and x.stride(-1) == 1 for x in (key, value))
         and hidden.stride(-1) == 1
         and all(
-            g.shape == (10240,)
+            g.shape == (width,)
             and g.device == hidden.device
             and g.dtype == torch.bfloat16
             and g.is_contiguous()
@@ -119,7 +143,7 @@ def try_ple_gate(
     gated = torch.empty(hidden.shape, device=hidden.device, dtype=hidden.dtype)
     normed = torch.empty_like(gated)
     if hidden.shape[1]:
-        _ple_gate[(hidden.shape[0] * hidden.shape[1], 4)](
+        _ple_gate[(hidden.shape[0] * hidden.shape[1], width // hidden_size)](
             key,
             value,
             hidden,
@@ -129,13 +153,13 @@ def try_ple_gate(
             gated,
             normed,
             *(projection_scales if projected else (None, None)),
-            WIDTH=10240,
-            H=2560,
+            WIDTH=width,
+            H=hidden_size,
             EPS=eps,
             KEY_STRIDE=key.stride(1),
             VALUE_STRIDE=value.stride(1),
             HIDDEN_STRIDE=hidden.stride(1),
-            BLOCK=4096,
+            BLOCK=triton.next_power_of_2(hidden_size),
             num_warps=4,
             PROJECTED_FP32=projected,
         )

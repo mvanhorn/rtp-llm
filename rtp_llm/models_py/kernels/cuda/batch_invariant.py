@@ -1,10 +1,20 @@
-"""CUDA kernels with a fixed reduction order for each token."""
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""CUDA kernels with a fixed reduction order for each token.
+
+Persistent GEMM and 2D attention's online softmax are adapted from vLLM
+db9527a46873454610df6dbedf79a36d6bf1a7f6 (v0.31.0):
+vllm/model_executor/determinism/batch_invariant.py and
+vllm/v1/attention/ops/triton_{unified_attention,attention_helpers}.py.
+"""
 
 from contextlib import nullcontext
 
 import torch
 import triton
 import triton.language as tl
+
+from .batch_invariant_nvfp4 import nvfp4_activation, nvfp4_weight
 
 
 @triton.jit(do_not_specialize=["rows", "x_scale_row_stride", "x_scale_col_stride"])
@@ -23,6 +33,7 @@ def _linear(
     block_m: tl.constexpr,
     block_n: tl.constexpr,
     block_k: tl.constexpr,
+    num_sms: tl.constexpr,
     x_scales=None,
     weight_scales=None,
     x_scale_row_stride=0,
@@ -30,57 +41,92 @@ def _linear(
     weight_scale_row_stride: tl.constexpr = 0,
     weight_scale_col_stride: tl.constexpr = 0,
     packed_scales: tl.constexpr = False,
+    nvfp4_input_scale=None,
+    nvfp4_weight_scale=None,
 ):
-    m = tl.program_id(0).to(tl.int64) * block_m + tl.arange(0, block_m)
-    n = tl.program_id(1).to(tl.int64) * block_n + tl.arange(0, block_n)
+    # vLLM's persistent, grouped tile traversal. Worker assignment may change
+    # with M, while every tile still reduces the complete K dimension.
+    tiles_m = tl.cdiv(rows, block_m)
+    tiles_n = tl.cdiv(cols, block_n)
+    group_m: tl.constexpr = 8
+    tiles_per_group = group_m * tiles_n
     k = tl.arange(0, block_k)
-    acc = tl.zeros((block_m, block_n), tl.float32)
-    # Every output tile reduces the complete K dimension in the same order.
-    for tile in range(tl.cdiv(inner, block_k)):
-        index = tile * block_k + k
-        a = tl.load(
-            x + m[:, None] * inner + index[None, :],
-            (m[:, None] < rows) & (index[None, :] < inner),
-            other=0.0,
-        )
-        b = tl.load(
-            weight
-            + n[None, :] * weight_row_stride
-            + index[:, None] * weight_col_stride,
-            (n[None, :] < cols) & (index[:, None] < inner),
-            other=0.0,
-        )
-        if x_scales is not None:
-            group = tile
-            scale_col = group // 4 if packed_scales else group
-            scale_row = n if packed_scales else n // 128
-            sx = tl.load(
-                x_scales + m * x_scale_row_stride + scale_col * x_scale_col_stride,
-                m < rows,
-                other=0,
+    if nvfp4_input_scale is not None:
+        global_input_scale = tl.load(nvfp4_input_scale)
+        global_scale = global_input_scale * tl.load(nvfp4_weight_scale)
+    for tile_id in tl.range(tl.program_id(0), tiles_m * tiles_n, num_sms, flatten=True):
+        first_m = tile_id // tiles_per_group * group_m
+        group_width = tl.minimum(tiles_m - first_m, group_m)
+        tile_in_group = tile_id % tiles_per_group
+        pid_m = first_m + tile_in_group % group_width
+        pid_n = tile_in_group // group_width
+        m = pid_m.to(tl.int64) * block_m + tl.arange(0, block_m)
+        n = pid_n.to(tl.int64) * block_n + tl.arange(0, block_n)
+        acc = tl.zeros((block_m, block_n), tl.float32)
+        for tile in range(tl.cdiv(inner, block_k)):
+            index = tile * block_k + k
+            a = tl.load(
+                x + m[:, None] * inner + index[None, :],
+                (m[:, None] < rows) & (index[None, :] < inner),
+                other=0.0,
             )
-            sw = tl.load(
-                weight_scales
-                + scale_row * weight_scale_row_stride
-                + scale_col * weight_scale_col_stride,
-                n < cols,
-                other=0,
-            )
-            if packed_scales:
-                shift = (group % 4) * 8
-                sx = (((sx >> shift) & 0xFF) << 23).to(tl.float32, bitcast=True)
-                sw = (((sw >> shift) & 0xFF) << 23).to(tl.float32, bitcast=True)
-            partial = tl.dot(a.to(tl.float16), b.to(tl.float16))
-            acc += partial * (sx[:, None] * sw[None, :])
-        else:
-            acc = tl.dot(a, b, acc, input_precision="ieee")
-    if has_bias:
-        acc += tl.load(bias + n * bias_stride, n < cols, other=0)[None, :]
-    tl.store(
-        output + m[:, None] * cols + n[None, :],
-        acc,
-        (m[:, None] < rows) & (n[None, :] < cols),
-    )
+            valid_weight = (n[None, :] < cols) & (index[:, None] < inner)
+            if nvfp4_input_scale is not None:
+                a = nvfp4_activation(a, global_input_scale, block_m, block_k)
+                b = nvfp4_weight(
+                    weight,
+                    weight_scales,
+                    index,
+                    n,
+                    weight_row_stride,
+                    weight_col_stride,
+                    weight_scale_row_stride,
+                    weight_scale_col_stride,
+                    valid_weight,
+                )
+            else:
+                b = tl.load(
+                    weight
+                    + n[None, :] * weight_row_stride
+                    + index[:, None] * weight_col_stride,
+                    valid_weight,
+                    other=0.0,
+                )
+            if x_scales is not None:
+                scale_col = tile // 4 if packed_scales else tile
+                scale_row = n if packed_scales else n // 128
+                sx = tl.load(
+                    x_scales + m * x_scale_row_stride + scale_col * x_scale_col_stride,
+                    m < rows,
+                    other=0,
+                )
+                sw = tl.load(
+                    weight_scales
+                    + scale_row * weight_scale_row_stride
+                    + scale_col * weight_scale_col_stride,
+                    n < cols,
+                    other=0,
+                )
+                if packed_scales:
+                    shift = (tile % 4) * 8
+                    sx = (((sx >> shift) & 0xFF) << 23).to(tl.float32, bitcast=True)
+                    sw = (((sw >> shift) & 0xFF) << 23).to(tl.float32, bitcast=True)
+                partial = tl.dot(a.to(tl.float16), b.to(tl.float16))
+                acc += partial * (sx[:, None] * sw[None, :])
+            else:
+                if a.dtype == tl.float8e4nv:
+                    a = a.to(tl.float16)
+                    b = b.to(tl.float16)
+                acc = tl.dot(a, b, acc, input_precision="ieee")
+        if nvfp4_input_scale is not None:
+            acc *= global_scale
+        if has_bias:
+            acc += tl.load(bias + n * bias_stride, n < cols, other=0)[None, :]
+        tl.store(
+            output + m[:, None] * cols + n[None, :],
+            acc,
+            (m[:, None] < rows) & (n[None, :] < cols),
+        )
 
 
 def linear(
@@ -114,8 +160,13 @@ def _launch_linear(
     out_dtype: torch.dtype,
     x_scales: torch.Tensor | None = None,
     weight_scales: torch.Tensor | None = None,
+    nvfp4_input_scale: torch.Tensor | None = None,
+    nvfp4_weight_scale: torch.Tensor | None = None,
+    group_size: int = 128,
 ) -> torch.Tensor:
     cols, inner = weight.shape
+    if nvfp4_input_scale is not None:
+        inner *= 2
     if bias is not None:
         if bias.numel() != cols or bias.device != x.device:
             raise ValueError("batch-invariant linear bias must match the weight output")
@@ -124,22 +175,40 @@ def _launch_linear(
     output = torch.empty((*x.shape[:-1], cols), device=x.device, dtype=out_dtype)
     if rows and cols:
         block_m, block_n = 16, 64
-        block_k = 128 if x_scales is not None else 32
-        scale_options = (
-            {
-                "x_scales": x_scales,
-                "weight_scales": weight_scales,
-                "x_scale_row_stride": x_scales.stride(0),
-                "x_scale_col_stride": x_scales.stride(1),
-                "weight_scale_row_stride": weight_scales.stride(0),
-                "weight_scale_col_stride": weight_scales.stride(1),
-                "packed_scales": weight_scales.dtype == torch.int32,
-            }
-            if x_scales is not None
-            else {}
-        )
+        block_k = group_size if x_scales is not None else 32
+        scale_options = {}
+        if weight_scales is not None:
+            scale_options.update(
+                {
+                    "weight_scales": weight_scales,
+                    "weight_scale_row_stride": weight_scales.stride(0),
+                    "weight_scale_col_stride": weight_scales.stride(1),
+                    "packed_scales": weight_scales.dtype == torch.int32,
+                }
+            )
+        if x_scales is not None:
+            scale_options.update(
+                {
+                    "x_scales": x_scales,
+                    "x_scale_row_stride": x_scales.stride(0),
+                    "x_scale_col_stride": x_scales.stride(1),
+                }
+            )
+        if nvfp4_input_scale is not None:
+            scale_options.update(
+                {
+                    "nvfp4_input_scale": nvfp4_input_scale,
+                    "nvfp4_weight_scale": nvfp4_weight_scale,
+                }
+            )
         with torch.cuda.device(x.device) if x.is_cuda else nullcontext():
-            _linear[(triton.cdiv(rows, block_m), triton.cdiv(cols, block_n))](
+            num_sms = (
+                torch.cuda.get_device_properties(x.device).multi_processor_count
+                if x.is_cuda
+                else 1
+            )
+            tiles = triton.cdiv(rows, block_m) * triton.cdiv(cols, block_n)
+            _linear[(min(tiles, num_sms),)](
                 x.contiguous(),
                 weight,
                 bias,
@@ -154,6 +223,7 @@ def _launch_linear(
                 block_m,
                 block_n,
                 block_k,
+                num_sms,
                 num_warps=4,
                 **scale_options,
             )
@@ -176,21 +246,35 @@ def fp8_per_tensor_linear(
         input_scale is not None and input_scale.numel() != 1
     ):
         raise ValueError("per-tensor FP8 linear requires scalar checkpoint scales")
-    if input_scale is None:
-        input_scale = (
-            rows.abs().amax(dim=1, keepdim=True).float().clamp_min(1e-12) / 448
-        )
-    quantized = (rows.float() / input_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-    # FP8 values are exactly representable in FP16. Keep the FP32 accumulator.
-    output = linear(quantized.half(), weight.half(), out_dtype=torch.float32)
+    quantized, input_scale = quantize_fp8_rows(rows, input_scale)
+    # FP8 values are exactly representable in FP16. Convert inside the tile
+    # where Triton supports FP8 loads, and keep the FP32 accumulator.
+    if torch.cuda.get_device_capability(x.device) >= (8, 9):
+        output = _launch_linear(quantized, weight, None, torch.float32)
+    else:
+        output = linear(quantized.half(), weight.half(), out_dtype=torch.float32)
     output *= input_scale * weight_scale
     if bias is not None:
         output += bias
     return output.to(out_dtype or x.dtype).reshape(*x.shape[:-1], weight.size(0))
 
 
+def quantize_fp8_rows(
+    rows: torch.Tensor, input_scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if input_scale is None:
+        input_scale = (
+            rows.abs().amax(dim=1, keepdim=True).float().clamp_min(1e-12) / 448
+        )
+    else:
+        input_scale = input_scale.reshape(1, 1).expand(rows.size(0), 1)
+    return (rows.float() / input_scale).clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    ), input_scale
+
+
 def quantize_fp8_blocks(
-    rows: torch.Tensor, packed: bool
+    rows: torch.Tensor, packed: bool, group_size: int = 128, *, eps: float = 1e-4
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
         create_per_token_group_quant_fp8_output_scale,
@@ -198,13 +282,15 @@ def quantize_fp8_blocks(
     from rtp_llm.ops.compute_ops import per_token_group_quant_fp8_v2
 
     rows = rows.contiguous()
-    if rows.size(1) % 128 != 0:
-        raise ValueError("batch-invariant block FP8 requires K divisible by 128")
+    if group_size not in (32, 128) or rows.size(1) % group_size:
+        raise ValueError(
+            "batch-invariant block FP8 requires K divisible by its group size"
+        )
     quantized = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
     scales = create_per_token_group_quant_fp8_output_scale(
         rows.shape,
         rows.device,
-        128,
+        group_size,
         column_major_scales=packed,
         scale_tma_aligned=packed,
         scale_ue8m0=packed,
@@ -212,7 +298,7 @@ def quantize_fp8_blocks(
     # Use the same quantizer for every batch size. Each scale sees one token.
     if rows.size(0):
         per_token_group_quant_fp8_v2(
-            rows, quantized, scales, 128, 1e-4, -448.0, 448.0, packed, False, None
+            rows, quantized, scales, group_size, eps, -448.0, 448.0, packed, False, None
         )
     return quantized, scales
 
@@ -222,12 +308,18 @@ def fp8_per_block_linear(
     weight: torch.Tensor,
     weight_scales: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    group_size: int = 128,
 ) -> torch.Tensor:
     if x.shape[-1] != weight.size(1):
         raise ValueError("batch-invariant linear input and weight dimensions differ")
     rows = x.reshape(-1, x.shape[-1])
-    quantized, scales = quantize_fp8_blocks(rows, weight_scales.dtype == torch.int32)
-    output = _launch_linear(quantized, weight, bias, x.dtype, scales, weight_scales)
+    quantized, scales = quantize_fp8_blocks(
+        rows, weight_scales.dtype == torch.int32, group_size
+    )
+    output = _launch_linear(
+        quantized, weight, bias, x.dtype, scales, weight_scales, group_size=group_size
+    )
     return output.reshape(*x.shape[:-1], weight.size(0))
 
 
@@ -359,16 +451,33 @@ def _rope(
     row_stride: tl.constexpr,
     head_dim: tl.constexpr,
     half_dim: tl.constexpr,
-    has_position_ids: tl.constexpr,
+    position_id_stride: tl.constexpr,
+    mrope_time: tl.constexpr,
+    mrope_height: tl.constexpr,
+    mrope_width: tl.constexpr,
+    mrope_interleaved: tl.constexpr,
     block: tl.constexpr,
 ):
     token = tl.program_id(0)
-    position = tl.load(layout + token * 5 + 3)
-    if position >= 0:
-        if has_position_ids:
-            position = tl.load(position_ids + token)
+    default_position = tl.load(layout + token * 5 + 3)
+    if default_position >= 0:
         index = tl.arange(0, block)
         valid = index < half_dim
+        if position_id_stride == 3:
+            if mrope_interleaved:
+                axis = tl.where((index % 3 == 1) & (index < 3 * mrope_height), 1, 0)
+                axis = tl.where((index % 3 == 2) & (index < 3 * mrope_width), 2, axis)
+            else:
+                axis = tl.where(
+                    index < mrope_time,
+                    0,
+                    tl.where(index < mrope_time + mrope_height, 1, 2),
+                )
+            position = tl.load(position_ids + 3 * token + axis, valid, other=0)
+        elif position_id_stride == 1:
+            position = tl.load(position_ids + token)
+        else:
+            position = default_position
         cache_offset = position.to(tl.int64) * (2 * half_dim) + index
         cos = tl.load(cos_sin + cache_offset, valid, other=0)
         sin = tl.load(cos_sin + cache_offset + half_dim, valid, other=0)
@@ -385,12 +494,20 @@ def apply_rope(
     layout: torch.Tensor,
     cos_sin: torch.Tensor,
     position_ids: torch.Tensor | None,
+    *,
+    mrope_sections: tuple[int, int, int] | None = None,
+    mrope_interleaved: bool = False,
 ) -> None:
     rows = query.size(0)
+    axes = 3 if mrope_sections is not None else 1
     if position_ids is not None and position_ids.numel() == 0:
         position_ids = None
-    if position_ids is not None and position_ids.numel() != rows:
-        raise ValueError("batch-invariant RoPE requires one position ID per token")
+    if position_ids is not None:
+        if position_ids.numel() != rows * axes:
+            raise ValueError(
+                f"batch-invariant RoPE requires {axes} position IDs per token"
+            )
+        position_ids = position_ids.contiguous()
     if rows:
         half_dim = cos_sin.size(1) // 2
         for tensor in (query, key):
@@ -402,7 +519,9 @@ def apply_rope(
                 tensor.stride(0),
                 tensor.size(2),
                 half_dim,
-                position_ids is not None,
+                axes if position_ids is not None else 0,
+                *(mrope_sections or (0, 0, 0)),
+                mrope_interleaved,
                 triton.next_power_of_2(half_dim),
             )
 
@@ -421,6 +540,7 @@ def _append_kv(
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
     kv_heads: tl.constexpr,
+    fp8: tl.constexpr,
     store_scale: tl.constexpr,
     block: tl.constexpr,
 ):
@@ -443,14 +563,23 @@ def _append_kv(
             dim < head_dim,
             other=0,
         )
-        tl.store(cache + cache_offset + dim, k, dim < head_dim)
-        tl.store(cache + cache_offset + kv_stride + dim, v, dim < head_dim)
         if store_scale:
+            k = k.to(tl.float32)
+            v = v.to(tl.float32)
+            k_scale = tl.maximum(tl.max(tl.abs(k), axis=0), 1e-6) / 448.0
+            v_scale = tl.maximum(tl.max(tl.abs(v), axis=0), 1e-6) / 448.0
             scale_offset = (
                 page * 2 * kv_heads + head
             ) * page_size + position % page_size
-            tl.store(scales + scale_offset, 1.0)
-            tl.store(scales + scale_offset + kv_heads * page_size, 1.0)
+            tl.store(scales + scale_offset, k_scale)
+            tl.store(scales + scale_offset + kv_heads * page_size, v_scale)
+            k = k / k_scale
+            v = v / v_scale
+        if fp8:
+            k = tl.clamp(k.to(tl.float32), -448.0, 448.0)
+            v = tl.clamp(v.to(tl.float32), -448.0, 448.0)
+        tl.store(cache + cache_offset + dim, k, dim < head_dim)
+        tl.store(cache + cache_offset + kv_stride + dim, v, dim < head_dim)
 
 
 def append_kv(
@@ -475,6 +604,7 @@ def append_kv(
             head_dim,
             cache.size(3),
             heads,
+            cache.dtype == torch.float8_e4m3fn,
             scales is not None,
             triton.next_power_of_2(head_dim),
         )
@@ -486,6 +616,8 @@ def _attention(
     key,
     value,
     cache,
+    kv_scales,
+    alibi_slopes,
     block_table,
     layout,
     output,
@@ -496,11 +628,13 @@ def _attention(
     page_stride: tl.constexpr,
     kv_stride: tl.constexpr,
     query_heads: tl.constexpr,
+    kv_heads: tl.constexpr,
     group_size: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
     scale: tl.constexpr,
     causal: tl.constexpr,
+    sliding_window: tl.constexpr,
     paged: tl.constexpr,
     block_h: tl.constexpr,
     block_n: tl.constexpr,
@@ -527,6 +661,11 @@ def _attention(
             length = position + 1
         else:
             length = tl.load(layout + token * 5 + 2) - start
+        first_key = 0
+        if sliding_window > 0:
+            first_key = tl.maximum(0, position - sliding_window + 1)
+            if not causal:
+                length = tl.minimum(length, position + sliding_window)
         q = tl.load(
             query
             + token.to(tl.int64) * query_row_stride
@@ -536,19 +675,21 @@ def _attention(
             other=0,
         )
         maximum = tl.full((block_h,), float("-inf"), tl.float32)
-        total = tl.zeros((block_h,), tl.float32)
+        total = tl.full((block_h,), 1.0, tl.float32)
         acc = tl.zeros((block_h, block_d), tl.float32)
-        # Use the same sequence-aligned tiles for prefill and decode. No
-        # split-KV or merge depends on other requests or the query chunk size.
-        for tile in range(tl.cdiv(length, block_n)):
+        if alibi_slopes is not None:
+            slopes = tl.load(alibi_slopes + q_head, group_head < group_size, other=0)
+        # Sequence-aligned KV tiles with one online reduction per query.
+        for tile in range(first_key // block_n, tl.cdiv(length, block_n)):
             index = tile * block_n + tl.arange(0, block_n)
-            valid = (index[:, None] < length) & (dim[None, :] < head_dim)
+            valid_key = (index >= first_key) & (index < length)
+            valid = valid_key[:, None] & (dim[None, :] < head_dim)
             if paged:
                 page = tl.load(
                     block_table
                     + sequence.to(tl.int64) * table_stride
                     + index // page_size,
-                    index < length,
+                    valid_key,
                     other=0,
                 ).to(tl.int64)
                 offset = (
@@ -559,6 +700,18 @@ def _attention(
                 v = tl.load(
                     cache + offset[:, None] + kv_stride + dim[None, :], valid, other=0.0
                 )
+                if kv_scales is not None:
+                    scale_offset = (
+                        page * 2 * kv_heads + kv_head
+                    ) * page_size + index % page_size
+                    k_scale = tl.load(kv_scales + scale_offset, valid_key, other=0.0)
+                    v_scale = tl.load(
+                        kv_scales + scale_offset + kv_heads * page_size,
+                        valid_key,
+                        other=0.0,
+                    )
+                    k = k.to(tl.float32) * k_scale[:, None]
+                    v = v.to(tl.float32) * v_scale[:, None]
             else:
                 row = (start + index).to(tl.int64)
                 k = tl.load(
@@ -580,14 +733,26 @@ def _attention(
             k = k.to(q.dtype)
             v = v.to(q.dtype)
             score = tl.dot(q, tl.trans(k)) * scale
-            score = tl.where(index[None, :] < length, score, float("-inf"))
-            next_maximum = tl.maximum(maximum, tl.max(score, 1))
-            correction = tl.exp(maximum - next_maximum)
-            probability = tl.exp(score - next_maximum[:, None])
-            total = total * correction + tl.sum(probability, 1)
-            acc = tl.dot(probability.to(v.dtype), v, acc * correction[:, None])
-            maximum = next_maximum
+            if alibi_slopes is not None:
+                score -= slopes[:, None] * tl.abs(index - position)[None, :]
+            score = tl.where(valid_key[None, :], score, float("-inf"))
+            maximum, total, probability, correction = _softmax_step(
+                score, maximum, total
+            )
+            acc = acc * correction[:, None]
+            acc += tl.dot(probability.to(v.dtype), v)
         tl.store(out, acc / total[:, None], valid_output)
+
+
+@triton.jit
+def _softmax_step(score, maximum, total):
+    """Online softmax update from vLLM's unified attention."""
+    next_maximum = tl.maximum(maximum, tl.max(score, axis=1))
+    next_maximum = tl.where(next_maximum > float("-inf"), next_maximum, 0.0)
+    probability = tl.exp(score - next_maximum[:, None])
+    correction = tl.exp(maximum - next_maximum)
+    total = total * correction + tl.sum(probability, axis=1)
+    return next_maximum, total, probability, correction
 
 
 def attention(
@@ -600,6 +765,9 @@ def attention(
     *,
     causal: bool,
     scale: float,
+    sliding_window: int = 0,
+    kv_scales: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows, query_heads, head_dim = query.shape
     kv_heads = key.size(1)
@@ -614,6 +782,8 @@ def attention(
             key,
             value,
             cache,
+            kv_scales,
+            alibi_slopes,
             block_table,
             layout,
             output,
@@ -624,11 +794,13 @@ def attention(
             cache.stride(0) if cache is not None else 0,
             cache.stride(1) if cache is not None else 0,
             query_heads,
+            kv_heads,
             group_size,
             head_dim,
             cache.size(3) if cache is not None else 0,
             scale,
             causal,
+            sliding_window,
             cache is not None,
             block_h,
             32,

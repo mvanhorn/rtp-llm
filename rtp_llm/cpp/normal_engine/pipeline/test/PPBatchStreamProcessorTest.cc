@@ -1767,6 +1767,7 @@ TEST_F(PPBatchStreamProcessorTest, FillResultCommitsLastSampleAndCopiesRequested
     EXPECT_TRUE(torch::equal(requested.hidden_states, output.hidden_states.narrow(0, 0, 2).cpu()));
     EXPECT_TRUE(torch::equal(requested.all_hidden_states, output.all_hidden_states.narrow(0, 0, 4).cpu()));
     EXPECT_FALSE(requested.loss.defined());
+    EXPECT_FALSE(requested.raw_logprobs.defined());
     const auto& unrequested = result.request_outputs[1];
     EXPECT_FALSE(unrequested.logits.defined());
     EXPECT_FALSE(unrequested.softmax_probs.defined());
@@ -2042,6 +2043,63 @@ TEST_F(PPBatchStreamProcessorTest, FillResultPromptLogitsAreRequestLocalAndUseFi
     }
 }
 
+TEST_F(PPBatchStreamProcessorTest, BatchInvariantRawAndPromptScoresMatchAcrossRequestBatches) {
+    setVocab(4);
+    auto cfg                 = config();
+    cfg.return_softmax_probs = true;
+    cfg.return_prompt_logits = true;
+    cfg.prompt_logits_top_k  = 2;
+    cfg.prompt_logits_start  = 0;
+    cfg.prompt_logits_end    = 1;
+    const auto target        = makeStream(101, {0, 1, 2}, cfg);
+    const auto other         = makeStream(202, {3});
+    const auto processor     = PPBatchStreamProcessor(model_config_,
+                                                  PDSepConfig{},
+                                                  ProfilingDebugLoggingConfig{},
+                                                  cache_config_,
+                                                  SpeculativeExecutionConfig{},
+                                                  true,
+                                                  true);
+    auto       row_logits    = torch::tensor({-10000.5f, -10000.f, -10002.f, -9999.5f, 9000.f, 9999.f}).cuda();
+
+    auto run = [&](const std::list<GenerateStreamPtr>& streams, int64_t target_row) {
+        const auto      plan = makePlan(processor, StreamGroups(streams));
+        const auto      size = plan.sampling_plan.request_ids.numel();
+        GptModelOutputs output;
+        output.logits     = torch::zeros({size, 6}, row_logits.options());
+        output.all_logits = torch::zeros({plan.model_input.combo_tokens.numel(), 6}, row_logits.options());
+        output.logits[target_row].copy_(row_logits);
+        const auto prompt_start =
+            target_row == 0 ? 0 : plan.model_input.lm_output_indexes[target_row - 1].item<int>() + 1;
+        output.all_logits[prompt_start].copy_(row_logits);
+
+        auto sampling                     = makeSamplingOutput(plan.sampling_plan);
+        sampling.sampler_output.token_ids = torch::full({size, 1}, -1, torch::kInt32);
+        sampling.sampler_output.token_ids[target_row].fill_(1);
+        sampling.sampler_output.success = sampling.sampler_output.token_ids.reshape({size}).ge(0);
+        PPExecutionResult result;
+        processor.fillExecutionResult(plan, output, sampling, {}, result);
+        EXPECT_TRUE(result.request_errors[target_row].ok());
+        if (size > 1) {
+            EXPECT_TRUE(result.request_errors[1 - target_row].hasError());
+            EXPECT_FALSE(result.request_outputs[1 - target_row].raw_logprobs.defined());
+        }
+        return result.request_outputs[target_row];
+    };
+
+    const auto solo = run({target}, 0);
+    ASSERT_EQ(solo.raw_logprobs.scalar_type(), torch::kFloat32);
+    ASSERT_TRUE(solo.prompt_logits.has_value());
+    EXPECT_TRUE(torch::equal(solo.raw_logprobs.reshape({1}), solo.prompt_logits->target_logprobs));
+    const auto expected = torch::log_softmax(row_logits.narrow(0, 0, 4), 0)[1].item<float>();
+    EXPECT_NEAR(solo.raw_logprobs.item<float>(), expected, 1e-6);
+    for (const auto& mixed : {run({target, other}, 0), run({other, target}, 1)}) {
+        EXPECT_TRUE(torch::equal(solo.raw_logprobs, mixed.raw_logprobs));
+        ASSERT_TRUE(mixed.prompt_logits.has_value());
+        EXPECT_TRUE(torch::equal(solo.prompt_logits->target_logprobs, mixed.prompt_logits->target_logprobs));
+    }
+}
+
 /** Dispatch commits each successful request's slice and retires every returned inflight row. */
 TEST_F(PPBatchStreamProcessorTest, PrefillOnlyDispatchFinishesWithoutTokensOrPdHandoff) {
     for (auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
@@ -2170,6 +2228,7 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchUsesRequestOutputsAcrossMixedPh
     multi_result.hidden_states     = torch::arange(104, 112, torch::kFloat32).reshape({2, 4});
     multi_result.all_hidden_states = torch::arange(204, 228, torch::kFloat32).reshape({6, 4});
     multi_result.softmax_probs     = torch::tensor({0.2f, 0.3f}).reshape({2, 1});
+    multi_result.raw_logprobs      = torch::tensor({-1.4f, -1.1f}).reshape({2, 1});
     multi_result.cum_log_probs     = torch::tensor({-2.0f, -3.0f});
     multi_result.all_probs         = torch::zeros({2, 64});
     for (int row = 0; row < 2; ++row) {
@@ -2208,6 +2267,8 @@ TEST_F(PPBatchStreamProcessorTest, NormalDispatchUsesRequestOutputsAcrossMixedPh
                                  result.request_outputs[1].prompt_logits->topk_token_ids));
         ASSERT_TRUE(output.aux_info.softmax_probs.has_value());
         EXPECT_NEAR(output.aux_info.softmax_probs->item<float>(), sequence == 0 ? 0.2f : 0.3f, 1e-6);
+        ASSERT_TRUE(output.aux_info.raw_logprobs.has_value());
+        EXPECT_TRUE(torch::equal(output.aux_info.raw_logprobs.value(), multi_result.raw_logprobs[sequence]));
         ASSERT_TRUE(output.aux_info.cum_log_probs.has_value());
         EXPECT_FLOAT_EQ(output.aux_info.cum_log_probs->item<float>(), -2.0f - sequence);
         ASSERT_TRUE(output.aux_info.all_probs.has_value());

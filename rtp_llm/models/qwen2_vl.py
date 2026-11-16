@@ -200,6 +200,24 @@ class QWen2VLWeightInfo(ModelDeployWeightInfo):
 
 
 class QWen2_VL(QWen_VL):
+    def _create_python_model(self):
+        if not getattr(self.hw_kernel_config, "batch_invariant", False):
+            return super()._create_python_model()
+
+        from rtp_llm.models_py.model_desc.qwen3vl import Qwen3VLModel
+
+        # Qwen2-VL uses the same decoder layer with its own weights and
+        # contiguous MRoPE sections. Route the visual embeddings through it.
+        self.py_model = Qwen3VLModel(
+            self.model_config,
+            self.parallelism_config,
+            self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            quant_config=self.model_config.quant_config,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+        )
+
     @classmethod
     def _create_config(cls, ckpt_path: str):
         config = ModelConfig()

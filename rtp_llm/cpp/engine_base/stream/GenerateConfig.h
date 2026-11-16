@@ -331,6 +331,7 @@ public:
         JSONIZE(select_tokens_str);
         JSONIZE(calculate_loss);
         JSONIZE(return_logits);
+        JSONIZE(return_softmax_probs);
         JSONIZE(return_prompt_logits);
         JSONIZE(prompt_logits_top_k);
         JSONIZE(prompt_logits_start);

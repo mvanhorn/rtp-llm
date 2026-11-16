@@ -15,6 +15,13 @@ models_py_test(
 )
 
 models_py_test(
+    name = "batch_invariant_qsa_test",
+    src = "batch_invariant_qsa_test.py",
+    gpu = "L20_CU13",
+    deps = ["//rtp_llm/models_py:models"],
+)
+
+models_py_test(
     name = "sparse_fmha_test",
     src = "sparse_fmha_test.py",
     gpu = "RTX_5000_PRO_CU13",

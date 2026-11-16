@@ -1,6 +1,6 @@
 """Fused MoE Triton kernel, adapted from SGLang/vLLM.
 
-Supports the BF16/FP16 path and dynamic-activation, 128x128 block-scaled FP8.
+Supports BF16/FP16, block-scaled FP8 and ModelOpt NVFP4.
 """
 
 from typing import Any, Dict
@@ -8,6 +8,12 @@ from typing import Any, Dict
 import torch
 import triton
 import triton.language as tl
+
+from rtp_llm.models_py.kernels.cuda.batch_invariant_nvfp4 import (
+    e2m1_weight,
+    nvfp4_activation,
+    nvfp4_weight,
+)
 
 
 @triton.jit
@@ -54,6 +60,13 @@ def fused_moe_kernel(
     use_fp8_w8a8: tl.constexpr,
     scale_ue8m0: tl.constexpr,
     even_Ks: tl.constexpr,
+    per_tensor_fp8: tl.constexpr = False,
+    mxfp4: tl.constexpr = False,
+    mxfp4_activation_group_size: tl.constexpr = 128,
+    nvfp4_input_scale_ptr=None,
+    nvfp4_weight_scale_ptr=None,
+    nvfp4_input_scale_stride: tl.constexpr = 0,
+    nvfp4_weight_scale_stride: tl.constexpr = 0,
 ):
     """
     Fused MoE GEMM kernel.
@@ -116,6 +129,13 @@ def fused_moe_kernel(
         else:
             offs_bsn = pid_n * BLOCK_SIZE_N // group_n
         b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+    if nvfp4_input_scale_ptr is not None:
+        input_global_scale = tl.load(
+            nvfp4_input_scale_ptr + off_experts * nvfp4_input_scale_stride
+        )
+        weight_global_scale = tl.load(
+            nvfp4_weight_scale_ptr + off_experts * nvfp4_weight_scale_stride
+        )
 
     # Accumulate in fp32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -130,12 +150,57 @@ def fused_moe_kernel(
                 other=0.0,
             )
 
-        if even_Ks:
+        if nvfp4_input_scale_ptr is not None:
+            a = nvfp4_activation(a, input_global_scale, BLOCK_SIZE_M, BLOCK_SIZE_K)
+            b = nvfp4_weight(
+                b_ptr + off_experts * stride_be,
+                b_scale_ptr + off_experts * stride_bse,
+                k_start + offs_k,
+                offs_bn,
+                stride_bn,
+                stride_bk,
+                stride_bsn,
+                stride_bsk,
+                offs_k[:, None] < K - k_start,
+            )
+        elif mxfp4:
+            b = e2m1_weight(
+                b_ptr + off_experts * stride_be,
+                k_start + offs_k,
+                offs_bn,
+                stride_bn,
+                stride_bk,
+                offs_k[:, None] < K - k_start,
+            )
+        elif even_Ks:
             b = tl.load(b_ptrs)
         else:
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k_start, other=0.0)
 
-        if use_fp8_w8a8:
+        if mxfp4:
+            group = k_start // mxfp4_activation_group_size
+            packed = tl.load(
+                a_scale_ptr
+                + offs_token // top_k * stride_asm
+                + group // 4 * stride_ask,
+                token_mask,
+                other=0,
+            )
+            sx = ((packed >> ((group % 4) * 8)) & 255) << 23
+            sw = (
+                tl.load(
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn * stride_bsn
+                    + k_start // 32 * stride_bsk
+                ).to(tl.int32)
+                << 23
+            )
+            accumulator += tl.dot(a.to(tl.float16), b.to(tl.float16)) * (
+                sx.to(tl.float32, bitcast=True)[:, None]
+                * sw.to(tl.float32, bitcast=True)[None, :]
+            )
+        elif use_fp8_w8a8:
             offs_ks = k_start // group_k
             if scale_ue8m0:
                 scale_pack_idx = offs_ks // 4
@@ -161,13 +226,24 @@ def fused_moe_kernel(
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
+        elif per_tensor_fp8:
+            accumulator = tl.dot(a.to(tl.float16), b.to(tl.float16), accumulator)
         else:
             accumulator += tl.dot(a, b)
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        if nvfp4_input_scale_ptr is None and not mxfp4:
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
     # Apply router weights if requested
+    if nvfp4_input_scale_ptr is not None:
+        accumulator *= input_global_scale * weight_global_scale
+    if per_tensor_fp8:
+        token_scale = tl.load(
+            a_scale_ptr + offs_token // top_k * stride_asm, token_mask, other=0.0
+        )
+        expert_scale = tl.load(b_scale_ptr + off_experts * stride_bse)
+        accumulator *= token_scale[:, None] * expert_scale
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator *= moe_weight[:, None]
@@ -198,6 +274,11 @@ def invoke_fused_moe_kernel(
     B_scale: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
     scale_ue8m0: bool = False,
+    nvfp4_input_scale: torch.Tensor | None = None,
+    nvfp4_weight_scale: torch.Tensor | None = None,
+    per_tensor_fp8: bool = False,
+    mxfp4: bool = False,
+    mxfp4_activation_group_size: int = 128,
 ) -> None:
     assert sorted_token_ids.stride(0) == 1
 
@@ -206,7 +287,8 @@ def invoke_fused_moe_kernel(
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
 
-    K = B.shape[2]
+    is_nvfp4 = nvfp4_input_scale is not None
+    K = B.shape[2] * (2 if is_nvfp4 or mxfp4 else 1)
     even_Ks = K % config["BLOCK_SIZE_K"] == 0
     use_fp8_w8a8 = block_shape is not None
     if use_fp8_w8a8:
@@ -236,6 +318,18 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+    elif is_nvfp4:
+        assert A_scale is None and B_scale is not None
+        block_n, block_k = 1, 16
+    elif mxfp4:
+        assert A_scale is not None and A_scale.dtype == torch.int32
+        assert B_scale is not None and B_scale.dtype == torch.uint8
+        assert mxfp4_activation_group_size in (32, 128)
+        assert config["BLOCK_SIZE_K"] == 32 and K % mxfp4_activation_group_size == 0
+        block_n, block_k = 1, 32
+    elif per_tensor_fp8:
+        assert A_scale is not None and B_scale is not None
+        block_n, block_k = 0, 0
     else:
         assert A_scale is None and B_scale is None
         block_n, block_k = 0, 0
@@ -274,6 +368,13 @@ def invoke_fused_moe_kernel(
         use_fp8_w8a8=use_fp8_w8a8,
         scale_ue8m0=scale_ue8m0,
         even_Ks=even_Ks,
+        per_tensor_fp8=per_tensor_fp8,
+        mxfp4=mxfp4,
+        mxfp4_activation_group_size=mxfp4_activation_group_size,
+        nvfp4_input_scale_ptr=nvfp4_input_scale,
+        nvfp4_weight_scale_ptr=nvfp4_weight_scale,
+        nvfp4_input_scale_stride=int(is_nvfp4 and nvfp4_input_scale.numel() != 1),
+        nvfp4_weight_scale_stride=int(is_nvfp4 and nvfp4_weight_scale.numel() != 1),
         **config,
     )
 

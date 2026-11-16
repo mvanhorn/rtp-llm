@@ -42,15 +42,26 @@ class MlaKVCacheWriteOp:
             kv_cache: MLA KV cache with compressed layout
         """
         if kv_cache is not None:
-            compute_ops.concat_and_cache_mla(
+            slots = fmha_params.slot_mapping
+            self.append(
                 append_ckv_t,
                 key_pe,
-                kv_cache.kv_cache_base,
-                (
-                    fmha_params.slot_mapping
-                    if total_global_ids is None
-                    else fmha_params.slot_mapping[total_global_ids]
-                ),
-                self.kv_cache_type,
-                self.scale,
+                kv_cache,
+                slots if total_global_ids is None else slots[total_global_ids],
             )
+
+    def append(
+        self,
+        compressed_kv: torch.Tensor,
+        rope_key: torch.Tensor,
+        kv_cache: LayerKVCache,
+        slots: torch.Tensor,
+    ) -> None:
+        compute_ops.concat_and_cache_mla(
+            compressed_kv,
+            rope_key,
+            kv_cache.kv_cache_base,
+            slots,
+            self.kv_cache_type,
+            self.scale,
+        )

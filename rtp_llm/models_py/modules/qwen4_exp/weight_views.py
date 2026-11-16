@@ -12,6 +12,8 @@ from rtp_llm.models_py.modules.base.common.fp8_linear import Fp8Linear
 from rtp_llm.models_py.modules.factory.linear.factory import LinearFactory
 from rtp_llm.utils.fp8_constants import FP8_STORAGE_SCALE_SUFFIX
 
+from .batch_invariant_projection import BatchInvariantProjection
+
 
 class PreparedWeightDict(dict):
     """Compute weights whose copied projections require a model restart to update."""
@@ -82,7 +84,12 @@ class Qwen4LinearFactory:
     ):
         storage_scale = weights.get(weight_key + FP8_STORAGE_SCALE_SUFFIX)
         if storage_scale is not None:
-            module = Fp8Linear(
+            projection = (
+                BatchInvariantProjection
+                if getattr(hw_kernel_config, "batch_invariant", False)
+                else Fp8Linear
+            )
+            module = projection(
                 weights[weight_key].t().contiguous(),
                 storage_scale,
                 weights.get(bias_key) if bias_key else None,

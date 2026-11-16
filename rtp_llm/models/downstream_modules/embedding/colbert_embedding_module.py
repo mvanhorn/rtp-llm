@@ -61,6 +61,8 @@ class ColbertEmbeddingRenderer(EmbeddingRendererBase):
 
 
 class ColBertEmbeddingHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.colbert_linear_path_ = os.path.join(
@@ -97,7 +99,13 @@ class ColBertEmbeddingHandler(CustomHandler):
         batch_hidden_states: torch.Tensor,
         batch_attention_mask: torch.Tensor,
     ):
-        colbert_vecs = self.colbert_linear(batch_hidden_states[:, 1:])
+        colbert_vecs = self.project(self.colbert_linear, batch_hidden_states[:, 1:])
         colbert_vecs = colbert_vecs * batch_attention_mask[:, 1:][:, :, None].float()
+        if self.batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant_norm import (
+                l2_normalize,
+            )
+
+            return l2_normalize(colbert_vecs)
         colbert_vecs = torch.nn.functional.normalize(colbert_vecs, dim=-1)
         return colbert_vecs

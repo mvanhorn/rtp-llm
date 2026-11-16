@@ -28,6 +28,7 @@ from rtp_llm.ops import (
     HWKernelConfig,
     KvCacheDataType,
     ProfilingDebugLoggingConfig,
+    RoleType,
     SpeculativeType,
     TaskType,
     VitSeparation,
@@ -80,11 +81,19 @@ class ModelFactory:
                 "RTP_BATCH_INVARIANT requires NVIDIA compute capability 8.0 or newer"
             )
         if (
-            parallelism.pp_size > 1
-            or parallelism.prefill_cp_config.is_enabled()
+            parallelism.prefill_cp_config.is_enabled()
             or parallelism.prefill_cp_config.is_prefill_enabled()
         ):
-            raise ValueError("RTP_BATCH_INVARIANT does not support PP or CP yet")
+            raise ValueError(
+                "RTP_BATCH_INVARIANT does not support context parallelism yet"
+            )
+        if (
+            parallelism.pp_size > 1
+            and engine_config.pd_sep_config.role_type != RoleType.PDFUSION
+        ):
+            raise ValueError(
+                "RTP_BATCH_INVARIANT with pipeline parallelism requires PDFUSION"
+            )
         if model_config.expert_num > 0 and (
             parallelism.dp_size > 1
             or parallelism.ep_size not in (1, parallelism.tp_size)
@@ -98,13 +107,16 @@ class ModelFactory:
             raise ValueError(
                 "RTP_BATCH_INVARIANT does not support speculative execution yet"
             )
-        if (
-            model_config.task_type != TaskType.LANGUAGE_MODEL
-            or model_config.is_multimodal()
-        ):
-            raise ValueError(
-                "RTP_BATCH_INVARIANT currently requires a text generation model"
+        if model_config.is_multimodal():
+            from rtp_llm.multimodal.multimodal_mixin_register import (
+                get_multimodal_mixin_cls,
             )
+
+            mixin = get_multimodal_mixin_cls(model_config.model_type)
+            if not mixin.supports_batch_invariant:
+                raise ValueError(
+                    f"RTP_BATCH_INVARIANT does not support {model_config.model_type} vision"
+                )
         quant = model_config.quant_config
         quant_method = quant.get_method() if quant is not None else None
         if quant_method not in (
@@ -113,37 +125,80 @@ class ModelFactory:
             "FP8_PER_TENSOR_COMPRESSED",
             "FP8_DYNAMIC_PER_TENSOR",
             "FP8_PER_BLOCK",
-        ) or (
-            model_config.expert_num > 0 and quant_method not in (None, "FP8_PER_BLOCK")
+            "modelopt_fp4",
         ):
             raise ValueError(
                 "RTP_BATCH_INVARIANT does not support this quantization yet"
             )
-        if quant_method == "FP8_PER_BLOCK" and capability < (8, 9):
-            raise ValueError(
-                "RTP_BATCH_INVARIANT with block FP8 requires NVIDIA SM89 or newer"
-            )
-        if (
-            model_config.has_positional_encoding
-            or model_config.use_attention_linear_bias
-            or getattr(model_config, "headwise_config", None)
+        if capability < (8, 9) and (
+            quant_method in ("FP8_PER_BLOCK", "modelopt_fp4")
+            or (quant_method is not None and model_config.expert_num > 0)
         ):
             raise ValueError(
-                "RTP_BATCH_INVARIANT does not support this position or head layout"
+                "RTP_BATCH_INVARIANT with block FP8 or NVFP4 requires NVIDIA SM89 or newer"
             )
+        if getattr(model_config, "headwise_config", None):
+            raise ValueError("RTP_BATCH_INVARIANT does not support headwise attention")
 
         from rtp_llm.models_py.modules.factory.attention.cuda_impl.batch_invariant import (
             BatchInvariantAttention,
         )
 
         attn = model_config.getAttentionConfigs(parallelism.get_attn_tp_size())
-        if not BatchInvariantAttention.supports_config(attn):
+        if model_config.use_attention_linear_bias and (attn.use_mla or attn.is_sparse):
+            raise ValueError("RTP_BATCH_INVARIANT requires dense MHA or GQA for ALiBi")
+        if model_config.model_type == "deepseek_v4":
+            if (
+                capability not in ((10, 0), (10, 3))
+                or parallelism.world_size != 1
+                or engine_config.pd_sep_config.role_type != RoleType.PDFUSION
+                or attn.dtype != torch.bfloat16
+                or attn.kv_cache_dtype != KvCacheDataType.FP8
+                or (attn.size_per_head, attn.rope_head_dim, attn.indexer_head_dim)
+                != (512, 64, 128)
+                or not set(attn.layer_compress_ratios).issubset({0, 4, 128})
+            ):
+                raise ValueError(
+                    "RTP_BATCH_INVARIANT requires single-GPU DeepSeek V4 PDFUSION "
+                    "with BF16, FP8 KV and the SWA/CSA/HCA cache layout on SM100 or SM103"
+                )
+            return
+        qwen4 = model_config.model_type == "qwen4_exp"
+        if qwen4 and (
+            attn.dtype != torch.bfloat16
+            or model_config.hc_mult != 4
+            or model_config.hidden_size > 4096
+        ):
+            raise ValueError(
+                "RTP_BATCH_INVARIANT requires Qwen4 BF16 with four HC branches "
+                "and hidden size at most 4096"
+            )
+        if model_config.has_positional_encoding and (
+            model_config.task_type == TaskType.LANGUAGE_MODEL or attn.is_causal
+        ):
+            raise ValueError(
+                "RTP_BATCH_INVARIANT does not support this position embedding layout"
+            )
+        if attn.use_mla:
+            from rtp_llm.models_py.modules.factory.attention.cuda_mla_impl.batch_invariant import (
+                BatchInvariantMlaAttention,
+            )
+
+            supports_attention = BatchInvariantMlaAttention.supports_config(attn)
+        else:
+            supports_attention = BatchInvariantAttention.supports_config(
+                attn, allow_sparse=qwen4 and attn.use_sparse_gqa_fmha
+            )
+        if not supports_attention:
             raise ValueError(
                 "RTP_BATCH_INVARIANT does not support this attention configuration"
             )
-        if attn.kv_cache_dtype == KvCacheDataType.FP8 and capability < (8, 9):
+        if (
+            attn.kv_cache_dtype == KvCacheDataType.FP8
+            or (attn.use_mla and attn.is_sparse)
+        ) and capability < (8, 9):
             raise ValueError(
-                "RTP_BATCH_INVARIANT with FP8 KV cache requires NVIDIA SM89 or newer"
+                "RTP_BATCH_INVARIANT with FP8 KV or index cache requires NVIDIA SM89 or newer"
             )
 
     @staticmethod

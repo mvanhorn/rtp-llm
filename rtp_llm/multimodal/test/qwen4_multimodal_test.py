@@ -52,7 +52,7 @@ def position_state(prefixes, lengths, positions, pool, table, *, graph=False):
 
 
 class Qwen4MultimodalTest(unittest.TestCase):
-    def check_mixed_vision_batch(self, device):
+    def check_mixed_vision_batch(self, device, *, batch_invariant=False):
         from rtp_llm.multimodal.multimodal_mixins.qwen3_5_moe import (
             qwen3_5_moe_vit as vit,
         )
@@ -77,6 +77,9 @@ class Qwen4MultimodalTest(unittest.TestCase):
         adapter = Qwen4ExpImageEmbedding.__new__(Qwen4ExpImageEmbedding)
         with patch.object(vit, "default_attn_impl", "sdpa"):
             adapter.visual = vit.Qwen3_5MoeVisionModel(config).eval().to(device)
+        if batch_invariant:
+            adapter.visual.to(torch.bfloat16)
+            adapter.enable_batch_invariant()
         adapter.mm_processor = self.processor()
         adapter.text_embedding = torch.randn(256, 32)
         image = Qwen4VisualInput(torch.randn(16, 12), torch.tensor([[1, 4, 4]]))
@@ -91,9 +94,20 @@ class Qwen4MultimodalTest(unittest.TestCase):
                 [image, video], [MMUrlType.IMAGE, MMUrlType.VIDEO]
             )
         self.assertEqual(forward.call_count, 1)
-        for result, reference in zip(actual, expected):
-            for left, right in zip(result, reference):
-                torch.testing.assert_close(left, right, atol=1e-5, rtol=1e-5)
+        batches = [actual]
+        if batch_invariant:
+            batches.append(
+                adapter.batched_embedding(
+                    [video, image], [MMUrlType.VIDEO, MMUrlType.IMAGE]
+                )[::-1]
+            )
+        tolerance = 0 if batch_invariant else 1e-5
+        for batch in batches:
+            for result, reference in zip(batch, expected):
+                for left, right in zip(result, reference):
+                    torch.testing.assert_close(
+                        left, right, atol=tolerance, rtol=tolerance
+                    )
 
     def test_mixed_image_video_reuses_one_shared_vision_forward_cpu(self):
         self.check_mixed_vision_batch("cpu")
@@ -101,6 +115,15 @@ class Qwen4MultimodalTest(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_mixed_image_video_reuses_one_shared_vision_forward_cuda(self):
         self.check_mixed_vision_batch("cuda")
+
+    @unittest.skipUnless(
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] >= 8,
+        "requires NVIDIA SM80+",
+    )
+    def test_mixed_image_video_is_batch_invariant(self):
+        self.check_mixed_vision_batch("cuda", batch_invariant=True)
 
     def assemble(self, grid, timestamps=None, device="cpu"):
         from rtp_llm.multimodal.multimodal_mixins.qwen3_5_moe.qwen3_5_moe_mixin import (

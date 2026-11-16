@@ -19,7 +19,7 @@ def sm120_suites():
             custom_smoke_test(
                 name = "qwen3_batch_invariant_sm120",
                 main = "sm120_qwen3_test.py",
-                smoke_args = "--RTP_BATCH_INVARIANT --role_type PDFUSION --act_type BF16 --warm_up 0 --tp_size 1 --world_size 1 --frontend_server_count 1 --max_seq_len 2048 --seq_size_per_block 64 --concurrency_limit 4 --enable_cuda_graph 1 --decode_capture_config '1,2'",
+                smoke_args = "--RTP_BATCH_INVARIANT --role_type PDFUSION --act_type BF16 --warm_up 0 --tp_size 1 --world_size 1 --frontend_server_count 1 --max_seq_len 2048 --seq_size_per_block 64 --max_context_batch_size 4 --concurrency_limit 4 --enable_cuda_graph 1 --decode_capture_config '1,2'",
                 data = [
                     "//rtp_llm:sdk",
                     "data/model/qwen3/q_r_1_7b_bf16_sm120.json",
@@ -27,6 +27,30 @@ def sm120_suites():
                 deps = ["//rtp_llm:transformers"],
                 gpu_type = ["RTX_5000_PRO_CU13"],
                 test_envs = {"RTP_TEST_BATCH_INVARIANT": "1"},
+            ),
+            custom_smoke_test(
+                name = "qwen3_batch_invariant_chunked_sm120",
+                main = "sm120_qwen3_test.py",
+                smoke_args = "--RTP_BATCH_INVARIANT --role_type PDFUSION --act_type BF16 --warm_up 0 --tp_size 1 --world_size 1 --frontend_server_count 1 --max_seq_len 2048 --seq_size_per_block 64 --prefill_chunk_size 128 --concurrency_limit 4 --enable_cuda_graph 1 --decode_capture_config '1' --reuse_cache 1 --enable_device_cache 1 --enable_memory_cache 0 --enable_remote_cache 0",
+                data = [
+                    "//rtp_llm:sdk",
+                    "data/model/qwen3/q_r_1_7b_bf16_sm120.json",
+                ],
+                deps = ["//rtp_llm:transformers"],
+                gpu_type = ["RTX_5000_PRO_CU13"],
+                test_envs = {"RTP_TEST_BATCH_INVARIANT": "chunked"},
+            ),
+            custom_smoke_test(
+                name = "qwen3_batch_invariant_pp2_sm120",
+                main = "sm120_qwen3_test.py",
+                smoke_args = "--RTP_BATCH_INVARIANT --role_type PDFUSION --act_type BF16 --warm_up 0 --pp_size 2 --tp_size 1 --world_size 2 --frontend_server_count 1 --max_seq_len 2048 --seq_size_per_block 64 --max_context_batch_size 4 --concurrency_limit 4 --enable_cuda_graph 0",
+                data = [
+                    "//rtp_llm:sdk",
+                    "data/model/qwen3/q_r_1_7b_bf16_sm120.json",
+                ],
+                deps = ["//rtp_llm:transformers"],
+                gpu_type = ["RTX_5000_PRO_CU13"],
+                test_envs = {"RTP_TEST_BATCH_INVARIANT": "pp"},
             ),
             smoke_test(
                 name = "generation_prefill_cuda_graph_sm120",
@@ -42,6 +66,22 @@ def sm120_suites():
                 task_info = "data/model/bert/q_r.json",
                 smoke_args = "--seq_size_per_block 16 --act_type FP16",
                 gpu_type = ["RTX_5000_PRO_CU13"],
+            ),
+            custom_smoke_test(
+                name = "embedding_bert_batch_invariant_sm120",
+                main = "embedding_batch_invariant_test.py",
+                smoke_args = "--RTP_BATCH_INVARIANT --task_type DENSE_EMBEDDING --seq_size_per_block 16 --act_type FP16",
+                data = ["//rtp_llm:sdk", "data/model/bert/q_r.json"],
+                gpu_type = ["RTX_5000_PRO_CU13"],
+                test_envs = {"RTP_TEST_BATCH_INVARIANT_TASK": "embedding"},
+            ),
+            custom_smoke_test(
+                name = "rerank_roberta_batch_invariant_sm120",
+                main = "embedding_batch_invariant_test.py",
+                smoke_args = "--RTP_BATCH_INVARIANT --task_type RERANKER --seq_size_per_block 16 --act_type FP16",
+                data = ["//rtp_llm:sdk", "data/model/bert/reranker_q_r.json"],
+                gpu_type = ["RTX_5000_PRO_CU13"],
+                test_envs = {"RTP_TEST_BATCH_INVARIANT_TASK": "rerank"},
             ),
         ],
     )

@@ -332,6 +332,8 @@ class Qwen2_VLImageEmbedding(MultiModalEmbeddingInterface):
 
 
 class Qwen2_VLMixin(BaseMultiModalMixin):
+    supports_batch_invariant = True
+
     def _init_multimodal(self):
         self.mm_part = Qwen2_VLImageEmbedding(self.mm_related_params)
         self.mm_related_params.vit_weights = Qwen2_VLVitWeight(

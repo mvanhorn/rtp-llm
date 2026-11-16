@@ -117,11 +117,8 @@ class Indexer(nn.Module):
         flashmla_params: Any,
         cp_params: Optional[Any],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        q = self.wq_b(q_lora)
-        q = q.view(-1, self.index_n_heads, self.index_head_dim)
-
-        k = self.wk(x)
-        k = self.k_norm(k)
+        q = self.wq_b(q_lora).view(-1, self.index_n_heads, self.index_head_dim)
+        k = self.k_norm(self.wk(x))
 
         if self._prefill_cp_enabled():
             assert cp_params is not None
@@ -135,6 +132,43 @@ class Indexer(nn.Module):
             query, key = self.indexer_op.apply_rope_and_rotate_q_k(q, k, positions)
 
         return query, key
+
+    def forward_batch_invariant(
+        self,
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        kv_cache: LayerKVCache,
+        layout: torch.Tensor,
+        pages: torch.Tensor,
+    ) -> torch.Tensor:
+        from rtp_llm.models_py.kernels.cuda.batch_invariant_mla import cache_slots
+        from rtp_llm.models_py.kernels.cuda.batch_invariant_norm import layer_norm
+        from rtp_llm.models_py.triton_kernels.legacy_fp8_indexer_score import (
+            packed_fp8_paged_mqa_topk,
+        )
+
+        q = self.wq_b(q_lora).view(-1, self.index_n_heads, self.index_head_dim)
+        k = layer_norm(
+            self.wk(hidden_states),
+            self.k_norm.weight,
+            self.k_norm.beta,
+            self.k_norm.variance_epsilon,
+        )
+        q, k = self.indexer_op.apply_rope_and_rotate_q_k(
+            q, k, layout[:, 3].clamp_min(0)
+        )
+        q_fp8, q_scale = self.indexer_op.quant_q_k(
+            q,
+            k,
+            kv_cache,
+            cache_slots(layout, self.blocksize),
+            batch_invariant=True,
+        )
+        weights = self._get_logits_head_gate(hidden_states, q_scale).squeeze(-1)
+        cache = self.indexer_op._indexer_cache_view(kv_cache)
+        return packed_fp8_paged_mqa_topk(
+            q_fp8, cache, weights, layout, pages, self.index_topk
+        )
 
     def _get_k_bf16(
         self,

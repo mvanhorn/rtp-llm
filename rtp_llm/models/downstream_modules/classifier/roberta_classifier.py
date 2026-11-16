@@ -22,6 +22,8 @@ class RobertaClassifierModule(CustomModule):
 
 
 class RobertaClassifierHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         num_labels = load_num_labels(self.config_.ckpt_path)
@@ -59,4 +61,5 @@ class RobertaClassifierHandler(CustomHandler):
         input_lengths: torch.Tensor,
     ) -> List[torch.Tensor]:
         first_tokens = get_first_token_from_combo_tokens(hidden_states, input_lengths)
-        return self.out_proj(torch.tanh(self.dense(first_tokens)))
+        dense = self.project(self.dense, first_tokens)
+        return self.project(self.out_proj, torch.tanh(dense))

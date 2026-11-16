@@ -80,6 +80,8 @@ class ALLEmbeddingRenderer(EmbeddingRendererBase):
 
 
 class NormalHandler(CustomHandler):
+    supports_batch_invariant = True
+
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 

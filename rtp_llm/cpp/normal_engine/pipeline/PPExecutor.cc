@@ -284,6 +284,8 @@ void PPExecutor::validateConfig(const EngineInitParams& params) const {
 
     const auto& cp_config  = parallelism_config.prefill_cp_config;
     const bool  sp_enabled = params.sp_config.type != SP_TYPE_NONE;
+    RTP_LLM_CHECK_WITH_INFO(!params.hw_kernel_config.batch_invariant || !sp_enabled,
+                            "RTP_BATCH_INVARIANT does not support PP speculative decoding");
     RTP_LLM_CHECK_WITH_INFO(!cp_config.is_enabled() || params.pd_sep_config.role_type == RoleType::PREFILL
                                 || (!sp_enabled && !(cp_config.kv_cache_sharded && parallelism_config.tp_size > 1)),
                             "pipeline parallelism with active CP requires the PREFILL role for speculative decoding "
@@ -384,7 +386,8 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
     if (!warm_up_ && isLastStage() && isStageRoot()) {
         const auto initial_sampler_batch_size =
             static_cast<size_t>(std::max<int64_t>(1, params.runtime_config.max_generate_batch_size));
-        sampler_ = std::make_unique<Sampler>(SamplerInitParams{initial_sampler_batch_size, false});
+        sampler_ = std::make_unique<Sampler>(
+            SamplerInitParams{initial_sampler_batch_size, false, params.hw_kernel_config.batch_invariant});
     }
 
     GptModelInitParams model_init_params(
@@ -532,7 +535,8 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
                                                                        params.profiling_debug_logging_config,
                                                                        cache_config,
                                                                        params.sp_config,
-                                                                       warm_up_);
+                                                                       warm_up_,
+                                                                       params.hw_kernel_config.batch_invariant);
     LogitsProcessorFactory::init(params.model_config_,
                                  params.grammar_config,
                                  params.sp_config.tree_decode_config,

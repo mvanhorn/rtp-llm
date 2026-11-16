@@ -108,6 +108,7 @@ class V4Args:
     fp8_kv_cache: bool = True
     # V4.1 uses delayed mHC readout and a distinct compressed attention layout.
     v41_config: Optional[Dict] = None
+    hw_kernel_config: Optional[object] = None
 
 
 def _block_kwargs(
@@ -180,6 +181,11 @@ def _build_block(
         **_block_kwargs(layer_id, args, layer_weights, commit_only=commit_only),
         v41_config=args.v41_config,
         shared_attention=shared_attention,
+        **(
+            {"hw_kernel_config": args.hw_kernel_config}
+            if getattr(args.hw_kernel_config, "batch_invariant", False)
+            else {}
+        ),
     )
 
 
@@ -249,7 +255,15 @@ class V4Transformer(nn.Module):
             # ``EmbeddingTorch`` keeps ``self.weight`` as a plain attribute (no
             # ``nn.Parameter``); the framework dict supplies the real tensor.
             self.embed = EmbeddingTorch(gw[W.embedding])
-            self.norm = RMSNorm(gw[W.final_ln_gamma], args.norm_eps)
+            self.norm = RMSNorm(
+                gw[W.final_ln_gamma],
+                args.norm_eps,
+                **(
+                    {"batch_invariant": True}
+                    if getattr(args.hw_kernel_config, "batch_invariant", False)
+                    else {}
+                ),
+            )
 
         # LM head — plain weight matrix [vocab_size, dim].  Accept either
         # BF16 (ckpt-native, used when ``enable_fp32_lm_head=False``) or

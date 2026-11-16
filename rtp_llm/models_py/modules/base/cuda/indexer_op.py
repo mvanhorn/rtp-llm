@@ -353,6 +353,8 @@ class IndexerOp(nn.Module):
         key: torch.Tensor,
         kv_cache: LayerKVCache,
         slot_mapping: torch.Tensor,
+        *,
+        batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Quantize query and key tensors, and cache the key.
@@ -370,14 +372,23 @@ class IndexerOp(nn.Module):
         """
         # Quantize query
         query_flat = query.view(-1, self.index_head_dim)
-        q_fp8, q_scale = sgl_per_token_group_quant_fp8(
-            query_flat,
-            group_size=self.block_size,
-            eps=1e-4,
-            column_major_scales=True,
-            scale_tma_aligned=True,
-            scale_ue8m0=(self.scale_fmt == "ue8m0"),
-        )
+        if batch_invariant:
+            from rtp_llm.models_py.kernels.cuda.batch_invariant import (
+                quantize_fp8_blocks,
+            )
+
+            q_fp8, q_scale = quantize_fp8_blocks(
+                query_flat, self.scale_fmt == "ue8m0", self.block_size
+            )
+        else:
+            q_fp8, q_scale = sgl_per_token_group_quant_fp8(
+                query_flat,
+                group_size=self.block_size,
+                eps=1e-4,
+                column_major_scales=True,
+                scale_tma_aligned=True,
+                scale_ue8m0=(self.scale_fmt == "ue8m0"),
+            )
         q_fp8 = q_fp8.view(-1, self.index_n_heads, self.index_head_dim)
 
         if self.scale_fmt == "ue8m0":

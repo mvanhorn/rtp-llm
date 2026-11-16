@@ -45,7 +45,11 @@ def is_supported(logits: torch.Tensor, normed: torch.Tensor, branches: int) -> b
 
 
 def fused_mix_reduce(
-    logits: torch.Tensor, normed: torch.Tensor, branches: int
+    logits: torch.Tensor,
+    normed: torch.Tensor,
+    branches: int,
+    *,
+    batch_invariant: bool = False
 ) -> torch.Tensor:
     if not is_supported(logits, normed, branches):
         raise ValueError("unsupported Qwen4 gated residual mix layout")
@@ -55,7 +59,11 @@ def fused_mix_reduce(
         (*logits.shape[:-1], hidden), device=logits.device, dtype=logits.dtype
     )
     block, warps = 128, 4
-    if hidden == 2560 and torch.cuda.get_device_capability(logits.device) == (12, 0):
+    if (
+        not batch_invariant
+        and hidden == 2560
+        and torch.cuda.get_device_capability(logits.device) == (12, 0)
+    ):
         # Fewer CTAs for the bandwidth-bound prefill consumer. The four BF16
         # products and their sequential FP32 sum keep the original boundaries.
         if 4093 <= rows <= 4096:

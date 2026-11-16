@@ -22,6 +22,32 @@ def cal_block_idx(x, seq_size_per_block):
     return (x - 1) // seq_size_per_block
 
 
+@triton.jit
+def gated_delta_step(
+    state,
+    query,
+    key,
+    value,
+    decay,
+    beta,
+    scale,
+    NORMALIZE_QK: tl.constexpr,
+    KEYWISE_DECAY: tl.constexpr = False,
+):
+    if NORMALIZE_QK:
+        query = query / tl.sqrt(tl.sum(query * query) + 1e-6)
+        key = key / tl.sqrt(tl.sum(key * key) + 1e-6)
+    query = query * scale
+    if KEYWISE_DECAY:
+        state *= exp(decay)[None, :]
+    else:
+        state *= exp(decay)
+    value -= tl.sum(state * key[None, :], 1)
+    value *= beta
+    state += value[:, None] * key[None, :]
+    return state, tl.sum(state * query[None, :], 1)
+
+
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -148,23 +174,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
         b_g = tl.load(p_g).to(tl.float32)
 
-        if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
-        # [BV, BK]
-        b_h *= exp(b_g)
-        # b_v[v] -= sum_k b_h[v, k] * b_k[k]
-        b_v -= tl.sum(b_h * b_k[None, :], 1)
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
         else:
             b_beta = tl.load(p_beta).to(tl.float32)
-        b_v *= b_beta
-        # [BV, BK] = outer(b_v, b_k)
-        b_h += b_v[:, None] * b_k[None, :]
-        # b_o[v] = sum_k b_h[v, k] * b_q[k]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
+        b_h, b_o = gated_delta_step(
+            b_h, b_q, b_k, b_v, b_g, b_beta, scale, USE_QK_L2NORM_IN_KERNEL
+        )
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # keep the states for multi-query tokens

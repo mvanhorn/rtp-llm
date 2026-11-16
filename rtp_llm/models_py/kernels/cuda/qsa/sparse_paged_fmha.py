@@ -141,6 +141,7 @@ def _sparse_paged_online_split_kernel(
     selected_width,
     max_blocks,
     cache_blocks,
+    layout_ptr,
     HAS_COUNT: tl.constexpr,
     FP8_CACHE: tl.constexpr,
     H_Q: tl.constexpr,
@@ -163,7 +164,12 @@ def _sparse_paged_online_split_kernel(
         q_ptr + batch * stride_q_b + head * stride_q_h + query * stride_q_s + rd
     ).to(tl.float32)
     row = selected_ptr + batch * stride_sel_b + query * stride_sel_s
-    kv_len = tl.load(kv_lens_ptr + batch * stride_len_b + query * stride_len_s)
+    if layout_ptr is None:
+        cache_row = batch
+        kv_len = tl.load(kv_lens_ptr + batch * stride_len_b + query * stride_len_s)
+    else:
+        cache_row = tl.load(layout_ptr + query * 5).to(tl.int64)
+        kv_len = tl.load(layout_ptr + query * 5 + 3) + 1
     maximum = tl.full((), float("-inf"), tl.float32)
     normalizer = tl.zeros((), tl.float32)
     acc = tl.zeros((D,), tl.float32)
@@ -186,7 +192,7 @@ def _sparse_paged_online_split_kernel(
         logical = index // PAGE_SIZE
         candidate = (offset < count) & (index >= 0) & (index < kv_len)
         physical = tl.load(
-            block_table_ptr + batch * stride_bt_b + logical * stride_bt_block,
+            block_table_ptr + cache_row * stride_bt_b + logical * stride_bt_block,
             mask=candidate & (logical < max_blocks),
             other=0,
         ).to(tl.int64)
@@ -227,7 +233,10 @@ def _sparse_paged_online_split_kernel(
         acc = acc * alpha + tl.sum(weights[:, None] * value, axis=0)
         normalizer = normalizer * alpha + tl.sum(weights)
         maximum = next_max
-    output_row = (batch * H_Q + head) * QUERY_LEN + query
+    if layout_ptr is None:
+        output_row = (batch * H_Q + head) * QUERY_LEN + query
+    else:
+        output_row = query * H_Q + head
     if NUM_SPLITS == 1:
         out = tl.where(normalizer > 0, acc / normalizer, 0.0)
         tl.store(partial_ptr + output_row * D + rd, out.to(q_ptr.dtype.element_ty))
@@ -556,6 +565,7 @@ def sparse_paged_gqa_attn(
             selected_width,
             int(block_table.shape[1]),
             cache_blocks,
+            None,
             HAS_COUNT=selected_has_count,
             FP8_CACHE=scale_view is not None,
             H_Q=q_heads,
@@ -587,4 +597,63 @@ def sparse_paged_gqa_attn(
         )
     elif output_gate is not None:
         output = output * torch.sigmoid(output_gate.transpose(1, 2))
+    return output
+
+
+def batch_invariant_sparse_paged_gqa(
+    query: torch.Tensor,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    layout: torch.Tensor,
+    selected: torch.Tensor,
+    *,
+    scale: float,
+    kv_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Packed sparse attention with a single fixed-order reduction per head."""
+    tokens, heads, head_dim = query.shape
+    _, _, kv_heads, page_size, _ = cache.shape
+    if (
+        selected.ndim != 2
+        or selected.shape[0] != tokens
+        or selected.dtype != torch.int32
+    ):
+        raise ValueError("batch-invariant QSA requires packed int32 token selections")
+    selected = selected.contiguous()
+    output = query.new_empty(query.shape)
+    if tokens:
+        _sparse_paged_online_split_kernel[(tokens, 1, heads)](
+            query,
+            cache,
+            cache if kv_scale is None else kv_scale,
+            block_table,
+            None,
+            selected,
+            output,
+            0,
+            query.stride(1),
+            query.stride(0),
+            *cache.stride()[:4],
+            *((0, 0, 0, 0) if kv_scale is None else kv_scale.stride()),
+            *block_table.stride(),
+            0,
+            0,
+            0,
+            selected.stride(0),
+            selected.size(1),
+            block_table.size(1),
+            cache.size(0),
+            layout,
+            HAS_COUNT=False,
+            FP8_CACHE=kv_scale is not None,
+            H_Q=heads,
+            H_KV=kv_heads,
+            QUERY_LEN=0,
+            PAGE_SIZE=page_size,
+            D=head_dim,
+            SCALE=scale,
+            BLOCK_K=_BLOCK_K,
+            NUM_SPLITS=1,
+            BLOCKS_PER_SPLIT=triton.cdiv(selected.size(1), _BLOCK_K),
+        )
     return output

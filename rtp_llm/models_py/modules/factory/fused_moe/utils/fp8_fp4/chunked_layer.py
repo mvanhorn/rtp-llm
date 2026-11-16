@@ -172,6 +172,7 @@ class ChunkedFp8Fp4MoeLayer(nn.Module):
         has_shared_expert_gate: bool = False,
         observer_factory: Optional[ObserverFactory] = None,
         record_function_scope: Callable[[], ContextManager] = nullcontext,
+        hw_kernel_config=None,
     ) -> None:
         super().__init__()
         if layer_weights is None:
@@ -208,6 +209,11 @@ class ChunkedFp8Fp4MoeLayer(nn.Module):
             has_shared_expert_gate=has_shared_expert_gate,
             physical_expert_num=n_physical_experts,
             is_decode_role=is_decode_role,
+            **(
+                {"hw_kernel_config": hw_kernel_config}
+                if getattr(hw_kernel_config, "batch_invariant", False)
+                else {}
+            ),
         )
         self.strategy_name = self._moe.strategy_name
 

@@ -43,8 +43,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         distributed_reduce: bool = False,
         weight_scale: Optional[torch.Tensor] = None,
         prefetch_budget_mb: int = 256,
+        batch_invariant: bool = False,
     ):
         super().__init__()
+        self.batch_invariant = batch_invariant
         if not shards:
             raise ValueError("ngram embedding needs at least one shard")
         self.output_dtype = (
@@ -393,7 +395,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # loading the distributed runtime; production TP reaches this path.
             from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 
-            out = all_reduce(out, group=Group.TP)
+            out = all_reduce(
+                out,
+                group=Group.TP,
+                **({"batch_invariant": True} if self.batch_invariant else {}),
+            )
         return out.flatten(-2)
 
     def forward(self, token_history: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -438,8 +444,10 @@ class Qwen4ExpPLELayer(nn.Module):
         conv_kernel_size: int,
         norm_eps: float,
         projection_scales=None,
+        batch_invariant: bool = False,
     ):
         super().__init__()
+        self.batch_invariant = batch_invariant
         hc_hidden = hc_mult * hidden_size
         if key_proj.shape[0] != hc_hidden:
             raise ValueError(f"key_proj out width {key_proj.shape[0]} != {hc_hidden}")
@@ -467,8 +475,15 @@ class Qwen4ExpPLELayer(nn.Module):
         from rtp_llm.models_py.modules.base.common.fp8_linear import make_projection
 
         scales = projection_scales if projection_scales is not None else (None, None)
-        self.key_projection = make_projection(key_proj, scales[0])
-        self.value_projection = make_projection(value_proj, scales[1])
+        projection = make_projection
+        if batch_invariant:
+            from rtp_llm.models_py.modules.qwen4_exp.batch_invariant_projection import (
+                BatchInvariantProjection,
+            )
+
+            projection = BatchInvariantProjection
+        self.key_projection = projection(key_proj, scales[0])
+        self.value_projection = projection(value_proj, scales[1])
         for projection in (self.key_projection, self.value_projection):
             if projection is not None and getattr(projection, "use_scaled_mm", False):
                 projection._qwen4_ple_unit_columns = projection.unit_scale.expand(
@@ -498,6 +513,22 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         )
         return hidden_states.transpose(1, 2)
+
+    def _invariant_conv(self, gated, normed, initial=None, residual=None):
+        from rtp_llm.models_py.kernels.cuda.qwen4_ple.conv import try_ple_conv
+
+        output = try_ple_conv(
+            gated.contiguous(),
+            normed.contiguous(),
+            initial,
+            self.conv_weight,
+            self.conv_dilation,
+            residual=None if residual is None else residual.contiguous(),
+            batch_invariant=True,
+        )
+        if output is None:
+            raise ValueError("unsupported batch-invariant Qwen4 PLE convolution layout")
+        return output
 
     def _gated_values(
         self,
@@ -541,11 +572,12 @@ class Qwen4ExpPLELayer(nn.Module):
             fused = try_ple_gate(
                 key,
                 value,
-                hyper_states,
+                hyper_states.contiguous() if self.batch_invariant else hyper_states,
                 self.norm_key,
                 self.norm_query,
                 self.norm_conv,
                 self.norm_eps,
+                **({"batch_invariant": True} if self.batch_invariant else {}),
             )
             if fused is not None:
                 gated_value, gated_value_normed = fused
@@ -554,6 +586,8 @@ class Qwen4ExpPLELayer(nn.Module):
                     gated_value = gated_value * keep
                     gated_value_normed = gated_value_normed * keep
                 return gated_value, gated_value_normed
+        if self.batch_invariant:
+            raise ValueError("unsupported batch-invariant Qwen4 PLE gate layout")
 
         branches = (self.hc_mult, self.hidden_size)
         key_normed = self._norm(key, self.norm_key).unflatten(-1, branches)
@@ -595,7 +629,10 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value, gated_value_normed = self._gated_values(
             hyper_states, token_history, padding_mask, embeddings=embeddings
         )
-        output = gated_value + self._short_conv(gated_value_normed)
+        if self.batch_invariant:
+            output = self._invariant_conv(gated_value, gated_value_normed)
+        else:
+            output = gated_value + self._short_conv(gated_value_normed)
         return output, self.prefill_conv_state(gated_value_normed)
 
     def prefill_with_state(
@@ -746,6 +783,27 @@ class Qwen4ExpPLELayer(nn.Module):
             raise ValueError("PLE snapshot prefill must contain at least one token")
         if embeddings is None:
             embeddings = self.ple_embedding(token_history, length)
+        if self.batch_invariant:
+            gated, normed = self._gated_values(
+                hyper_states, token_history, embeddings=embeddings
+            )
+            output = self._invariant_conv(
+                gated,
+                normed,
+                conv_buffer,
+                residual=hyper_states if add_residual else None,
+            )
+            state_len = self.short_conv_state_len
+            initial = (
+                normed.new_zeros((batch, state_len, width))
+                if conv_buffer is None
+                else conv_buffer
+            )
+            history = torch.cat((initial, normed), dim=1)
+            ends = [
+                min(start + page_size, length) for start in range(0, length, page_size)
+            ]
+            return output, [history[:, end : end + state_len] for end in ends]
         batched_bf16 = self._try_bf16_prefill_page_snapshots(
             hyper_states, embeddings, page_size, conv_buffer, add_residual
         )
@@ -929,6 +987,9 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value, gated_value_normed = self._gated_values(
             hyper_state, token_history_step, embeddings=embeddings
         )
+        if self.batch_invariant:
+            output = self._invariant_conv(gated_value, gated_value_normed, conv_buffer)
+            return output, torch.cat([conv_buffer, gated_value_normed], dim=1)[:, 1:]
         conv_in = torch.cat([conv_buffer, gated_value_normed], dim=1).transpose(1, 2)
         conv_out = F.silu(
             F.conv1d(
@@ -1002,6 +1063,11 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value, candidate_inputs = self._gated_values(
             hyper_states, token_history, embeddings=embeddings
         )
+        if self.batch_invariant:
+            return (
+                self._invariant_conv(gated_value, candidate_inputs, conv_buffer),
+                candidate_inputs,
+            )
         if hyper_states.is_cuda and torch.version.hip is None:
             from rtp_llm.models_py.kernels.cuda.qwen4_ple.conv import try_ple_conv
 

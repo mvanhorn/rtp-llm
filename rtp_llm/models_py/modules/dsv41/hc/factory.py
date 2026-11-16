@@ -20,7 +20,24 @@ def build_hc_unit(
     hc_eps: float,
     layer_id: int = -1,
     name: str = "",
+    batch_invariant: bool = False,
 ) -> HCUnitBase:
+    if batch_invariant:
+        from rtp_llm.models_py.modules.dsv4.hc.factory import build_hc_unit
+
+        return build_hc_unit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            layer_id=layer_id,
+            name=name,
+            batch_invariant=True,
+        )
     scale = maybe_squeeze_hc_1d(scale)
     from rtp_llm.models_py.modules.dsv41.hc.tilelang_impl import TileLangHCUnit
 

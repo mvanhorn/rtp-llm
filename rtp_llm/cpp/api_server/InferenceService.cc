@@ -183,7 +183,9 @@ void InferenceService::inferResponse(int64_t                                    
     std::vector<std::shared_ptr<GenerateInput>> inputs;
     inputs.reserve(req.input_texts.size());
     for (int i = 0; i < req.input_texts.size(); i++) {
-        auto input = fillGenerateInput(request_id, req.input_texts[i], req.input_urls[i], req.generate_configs[i]);
+        // Pipeline stages track the streams in a batch by request ID.
+        const auto stream_id = i == 0 ? request_id : request_counter_->incAndReturn();
+        auto input = fillGenerateInput(stream_id, req.input_texts[i], req.input_urls[i], req.generate_configs[i]);
         inputs.push_back(input);
     }
     auto [enqueue_successes, ori_streams] = engine_->enqueueMultiple(inputs);

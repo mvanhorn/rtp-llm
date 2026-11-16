@@ -25,9 +25,13 @@ class NewMlaRotaryEmbeddingOp(object):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        fmha_params: rtp_llm_ops.SparseMlaParams,
-        precomputed_pos_ids: torch.Tensor = None,
+        fmha_params: rtp_llm_ops.SparseMlaParams | None,
+        precomputed_pos_ids: torch.Tensor | None = None,
     ):
+        if precomputed_pos_ids is None:
+            if fmha_params is None:
+                raise ValueError("MLA rotary embedding requires token positions")
+            precomputed_pos_ids = fmha_params.positions_d
 
         rope._apply_rope_pos_ids_cos_sin_cache(
             q=query,
@@ -35,10 +39,6 @@ class NewMlaRotaryEmbeddingOp(object):
             q_rope=query,
             k_rope=key.unsqueeze(1),
             cos_sin_cache=self.cos_sin_cache,
-            pos_ids=(
-                precomputed_pos_ids
-                if precomputed_pos_ids is not None
-                else fmha_params.positions_d
-            ),
+            pos_ids=precomputed_pos_ids,
             interleave=not self.is_neox_style,
         )

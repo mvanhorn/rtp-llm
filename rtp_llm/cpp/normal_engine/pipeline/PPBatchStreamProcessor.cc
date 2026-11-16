@@ -90,8 +90,11 @@ PPBatchStreamProcessor::PPBatchStreamProcessor(const ModelConfig&               
                                                const ProfilingDebugLoggingConfig& profiling_debug_logging_config,
                                                const CacheConfig&                 cache_config,
                                                const SpeculativeExecutionConfig&  sp_config,
-                                               bool                               warm_up):
-    NormalBatchStreamProcessor(model_config, pd_sep_config, profiling_debug_logging_config, cache_config, warm_up),
+                                               bool                               warm_up,
+                                               bool                               batch_invariant):
+    NormalBatchStreamProcessor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, warm_up, 0, batch_invariant),
+    batch_invariant_(batch_invariant),
     sp_enabled_(sp_config.type != SP_TYPE_NONE),
     is_dspark_(sp_config.type == SP_TYPE_DSPARK),
     propose_step_(sp_config.gen_num_per_cycle),
@@ -598,10 +601,7 @@ SamplerInputs PPBatchStreamProcessor::gatherSamplerInputs(const PPSamplingPlan& 
         /** Mask padding while retaining output width; clone logits when callers need unmodified scores. */
         inputs.vocab_size = logits.size(1);
         inputs.logits     = output_config.return_logits || output_config.return_softmax_probs ? logits.clone() : logits;
-        const auto configured_vocab_size = output_vocab_ids_.empty() ?
-                                               static_cast<int64_t>(model_input_gatherer_config_.vocab_size) :
-                                               static_cast<int64_t>(output_vocab_ids_.size());
-        const auto valid_vocab_size      = std::min(logits.size(1), configured_vocab_size);
+        const auto valid_vocab_size = validVocabSize(logits.size(1));
         if (logits.size(1) > valid_vocab_size) {
             inputs.logits.narrow(1, valid_vocab_size, logits.size(1) - valid_vocab_size)
                 .fill_(-std::numeric_limits<float>::infinity());
@@ -851,7 +851,9 @@ void PPBatchStreamProcessor::fillExecutionResult(const PPExecutionPlan&  plan,
     }
     fillOptionalOutputs(plan, model_output, sampler_output, result);
     /** Vocabulary pruning excludes speculative decoding. */
-    if (!output_vocab_ids_.empty()) {
+    if (!output_vocab_ids_.empty() || batch_invariant_) {
+        const auto valid_vocab_size = output_vocab_ids_.empty() ? validVocabSize(model_output.logits.size(1)) :
+                                                                  static_cast<int64_t>(output_vocab_ids_.size());
         auto* tokens  = result.new_token_ids.data_ptr<int32_t>();
         auto* success = success_cpu.data_ptr<bool>();
         for (int64_t index = 0; index < result.new_token_ids.numel(); ++index) {
@@ -859,21 +861,28 @@ void PPBatchStreamProcessor::fillExecutionResult(const PPExecutionPlan&  plan,
             if (!success[index]) {
                 continue;
             }
-            const auto compact_id = tokens[index];
-            if (compact_id < 0 || static_cast<size_t>(compact_id) >= output_vocab_ids_.size()) {
-                RTP_LLM_LOG_ERROR("PP pruned sampling returned compact id %d outside [0, %zu)",
-                                  compact_id,
-                                  output_vocab_ids_.size());
+            const auto token_id = tokens[index];
+            if (token_id < 0 || token_id >= valid_vocab_size) {
+                RTP_LLM_LOG_ERROR("PP sampling returned token id %d outside [0, %ld)", token_id, valid_vocab_size);
                 success[index] = false;
                 continue;
             }
-            tokens[index] = static_cast<int32_t>(output_vocab_ids_[compact_id]);
+            if (!output_vocab_ids_.empty()) {
+                tokens[index] = static_cast<int32_t>(output_vocab_ids_[token_id]);
+            }
         }
     }
 
     const auto& processor_errors =
         is_spec_decode ? sampling_output.verify_output.processor_errors : sampler_output.processor_errors;
     collectRequestErrors(plan.sampling_plan, processor_errors, success_cpu, result.request_errors);
+}
+
+int64_t PPBatchStreamProcessor::validVocabSize(int64_t logits_width) const {
+    const auto configured_vocab_size = output_vocab_ids_.empty() ?
+                                           static_cast<int64_t>(model_input_gatherer_config_.vocab_size) :
+                                           static_cast<int64_t>(output_vocab_ids_.size());
+    return std::min(logits_width, configured_vocab_size);
 }
 
 void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
@@ -884,6 +893,7 @@ void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
     const auto    stream_count  = plan.sampling_plan.request_ids.size(0);
     torch::Tensor logits;
     torch::Tensor softmax_probs;
+    torch::Tensor raw_logprobs;
     torch::Tensor hidden_states;
     torch::Tensor all_hidden_states;
     torch::Tensor cum_log_probs;
@@ -894,18 +904,32 @@ void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
         logits = model_output.logits.to(torch::kCPU).contiguous();
     }
     if (output_config.return_softmax_probs) {
-        auto probs = model_output.logits.to(torch::kFloat32).contiguous();
-#if USING_CUDA
-        cudaSoftmaxInplace(probs, at::cuda::getCurrentCUDAStream().stream());
-#else
-        probs = torch::softmax(probs, -1);
+        const auto& token_ids = sampler_output.token_ids;
+        auto token_index = token_ids.narrow(1, token_ids.size(1) - 1, 1).to(model_output.logits.device(), torch::kLong);
+#if USING_CUDA && !USE_PPU
+        if (batch_invariant_) {
+            const auto vocab_size = validVocabSize(model_output.logits.size(1));
+            auto       raw_logits = model_output.logits.narrow(1, 0, vocab_size).to(torch::kFloat32).contiguous();
+            auto       stats      = cudaLogProbStats(raw_logits);
+            // A failed row can carry a sentinel id. Its placeholder score is discarded with the result error.
+            auto selected = raw_logits.gather(1, token_index.clamp(0, vocab_size - 1));
+            auto scores   = (selected - stats.narrow(1, 0, 1)) - stats.narrow(1, 1, 1);
+            raw_logprobs  = scores.to(torch::kCPU);
+            softmax_probs = scores.exp().to(torch::kCPU);
+        } else
 #endif
-        const auto& token_ids   = sampler_output.token_ids;
-        auto        token_index = token_ids.narrow(1, token_ids.size(1) - 1, 1).to(probs.device(), torch::kLong);
-        if (!output_vocab_ids_.empty()) {
-            token_index = token_index.clamp(0, probs.size(1) - 1);
+        {
+            auto probs = model_output.logits.to(torch::kFloat32).contiguous();
+#if USING_CUDA
+            cudaSoftmaxInplace(probs, at::cuda::getCurrentCUDAStream().stream());
+#else
+            probs = torch::softmax(probs, -1);
+#endif
+            if (!output_vocab_ids_.empty()) {
+                token_index = token_index.clamp(0, probs.size(1) - 1);
+            }
+            softmax_probs = probs.gather(1, token_index).to(torch::kCPU).contiguous();
         }
-        softmax_probs = probs.gather(1, token_index).to(torch::kCPU).contiguous();
     }
     if (output_config.return_hidden_states) {
         hidden_states = model_output.hidden_states.to(torch::kCPU).contiguous();
@@ -937,6 +961,9 @@ void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
         }
         if (request.return_softmax_probs) {
             output.softmax_probs = softmax_probs.narrow(0, batch_idx, stream_batch_size);
+            if (raw_logprobs.defined()) {
+                output.raw_logprobs = raw_logprobs.narrow(0, batch_idx, stream_batch_size);
+            }
         }
         if (request.return_cum_log_probs) {
             output.cum_log_probs = cum_log_probs.narrow(0, batch_idx, stream_batch_size);
@@ -970,13 +997,18 @@ void PPBatchStreamProcessor::fillOptionalOutputs(const PPExecutionPlan& plan,
                 }
                 const auto& prompt_request = request.prompt_logits;
                 if (prompt_request.enabled) {
+                    auto prompt_logits = model_output.all_logits.narrow(0, start, token_size);
+                    if (batch_invariant_) {
+                        prompt_logits = prompt_logits.narrow(1, 0, validVocabSize(prompt_logits.size(1)));
+                    }
                     output.prompt_logits =
-                        makePromptLogitsOutput(model_output.all_logits.narrow(0, start, token_size),
+                        makePromptLogitsOutput(prompt_logits,
                                                plan.model_input.combo_tokens.narrow(0, start, token_size),
                                                prompt_request.top_k,
                                                prompt_request.start,
                                                prompt_request.end,
-                                               prompt_request.return_target_logprob);
+                                               prompt_request.return_target_logprob,
+                                               batch_invariant_);
                 }
             }
         }
@@ -1272,7 +1304,10 @@ void PPBatchStreamProcessor::dispatchNormalSingleStream(const GenerateStreamPtr&
                     true,
                     false,
                     output.prompt_logits,
-                    std::nullopt},
+                    std::nullopt,
+                    GenerationPrefillCudaGraphStatus::NOT_REQUESTED,
+                    torch::Tensor(),
+                    output.raw_logprobs},
                    false);
 }
 

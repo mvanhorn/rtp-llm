@@ -89,6 +89,10 @@ class BertDecoderLayer(nn.Module):
 
 
 class BertModel(GptModelBase):
+    # The native LayerNorm kernels reduce one row per CTA with a width
+    # determined by hidden_size, independent of the number of input tokens.
+    supports_batch_invariant = True
+
     def __init__(
         self,
         config: ModelConfig,

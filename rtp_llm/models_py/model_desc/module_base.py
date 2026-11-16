@@ -111,6 +111,7 @@ class GptModelBase(nn.Module):
         if (
             self.batch_invariant
             and self.batch_invariant_rope_cache is None
+            and not self.config.attn_config.use_mla
             and self.config.attn_config.rope_config.style != RopeStyle.No
         ):
             from rtp_llm.models_py.modules.factory.attention.cuda_impl.batch_invariant import (

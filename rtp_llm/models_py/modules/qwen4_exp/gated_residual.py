@@ -7,11 +7,53 @@ from rtp_llm.models_py.modules.hybrid.gated_residual import GatedResidual
 
 
 class Qwen4GatedResidual(GatedResidual):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, batch_invariant=False, **kwargs):
         super().__init__(*args, **kwargs)
         self._hc_role = str(kwargs.get("role", "PDFUSION")).rsplit(".", 1)[-1]
+        self.batch_invariant = batch_invariant
+        if batch_invariant:
+            from .batch_invariant_projection import BatchInvariantProjection
+
+            scales = kwargs.get("weight_scales") or (None, None, None)
+            self.down_projection = BatchInvariantProjection(self.mix_down, scales[0])
+            self.up_projection = BatchInvariantProjection(self.mix_up, scales[1])
+            self.inject_projection = (
+                BatchInvariantProjection(self.inject, scales[2])
+                if self.inject is not None
+                else None
+            )
+            self.merged_down_inject = None
+
+    def _norm(self, hyper_input):
+        if self.batch_invariant:
+            from rtp_llm.models_py.triton_kernels.gated_residual.norm import (
+                grouped_rms_norm_triton,
+            )
+
+            return grouped_rms_norm_triton(
+                hyper_input.contiguous(),
+                self.norm_gamma.contiguous(),
+                self.hidden_size,
+                self.norm_eps,
+            )
+        return super()._norm(hyper_input)
 
     def _forward_normed(self, hyper_input, normed, *, down_input_scale=None):
+        if self.batch_invariant:
+            from rtp_llm.models_py.triton_kernels.gated_residual.mix import (
+                fused_mix_reduce,
+            )
+
+            down = torch.nn.functional.silu(self.down_projection(normed) / self.hc_mult)
+            mixed = fused_mix_reduce(
+                self.up_projection(down), normed, self.hc_mult, batch_invariant=True
+            )
+            gates = (
+                2 * torch.sigmoid(self.inject_projection(normed) / self.hc_mult)
+                if self.inject_projection is not None
+                else None
+            )
+            return mixed, hyper_input, gates
         up = self.up_projection
         weight = self.mix_up if up is None else up.weight
         scale = None if up is None else up.scale
@@ -57,7 +99,8 @@ class Qwen4GatedResidual(GatedResidual):
         # producer independently of the projection dtype, then ignore the
         # optional FP8 scale. Other layouts keep the shared implementation.
         if (
-            not self._has_forward_hooks()
+            not self.batch_invariant
+            and not self._has_forward_hooks()
             and self.down_projection is None
             and self.hc_mult == 4
         ):

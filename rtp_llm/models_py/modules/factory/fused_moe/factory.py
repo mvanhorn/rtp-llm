@@ -10,6 +10,7 @@ import torch
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
+from rtp_llm.utils.model_weight import W
 
 from .defs.fused_moe import FusedMoe
 from .strategy_registry import StrategyRegistry
@@ -61,17 +62,36 @@ class FusedMoeFactory:
             )
             from .impl.cuda.routers.pure_tp_router import PureTpRouterNoQuant
 
-            if config.moe_quant_method not in (None, "FP8_PER_BLOCK"):
+            fp8_per_tensor = config.moe_quant_method in (
+                "FP8",
+                "FP8_PER_TENSOR_COMPRESSED",
+                "FP8_DYNAMIC_PER_TENSOR",
+            )
+            if not fp8_per_tensor and config.moe_quant_method not in (
+                None,
+                "FP8_PER_BLOCK",
+                "modelopt_fp4",
+                "FP8_FP4",
+            ):
                 raise ValueError(
                     "RTP_BATCH_INVARIANT does not support this expert quantization"
                 )
-            quant = (
-                FusedMoEQuantConfig(
+            dtype = weights[W.moe_w1].dtype
+            if dtype == torch.uint8 and config.moe_quant_method == "modelopt_fp4":
+                quant = FusedMoEQuantConfig(quant_dtype=dtype, block_shape=[1, 16])
+            elif dtype == torch.int8 and config.moe_quant_method == "FP8_FP4":
+                quant = FusedMoEQuantConfig(quant_dtype=dtype, block_shape=[1, 32])
+            elif dtype == torch.float8_e4m3fn and config.moe_quant_method in (
+                "FP8_PER_BLOCK",
+                "FP8_FP4",
+            ):
+                quant = FusedMoEQuantConfig(
                     quant_dtype=torch.float8_e4m3fn, block_shape=[128, 128]
                 )
-                if config.moe_quant_method == "FP8_PER_BLOCK"
-                else FusedMoEQuantConfig()
-            )
+            elif dtype == torch.float8_e4m3fn and fp8_per_tensor:
+                quant = FusedMoEQuantConfig(quant_dtype=dtype, per_act_token_quant=True)
+            else:
+                quant = FusedMoEQuantConfig()
             return FusedMoe(
                 PureTpRouterNoQuant(config, quant, batch_invariant=True),
                 TritonFusedMoeExecutor(config, quant, weights, batch_invariant=True),

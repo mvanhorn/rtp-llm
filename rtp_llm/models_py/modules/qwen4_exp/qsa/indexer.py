@@ -432,6 +432,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
         norm_eps: float,
         projection_scale=None,
         rope_config=None,
+        batch_invariant=False,
     ):
         super().__init__()
         expected = (n_heads + kv_heads) * head_dim
@@ -447,9 +448,17 @@ class Qwen4ExpQSAIndexer(nn.Module):
                 f"compress_ratio {compress_ratio}"
             )
         self.qk_proj = qk_proj
-        from rtp_llm.models_py.modules.base.common.fp8_linear import make_projection
+        self.batch_invariant = batch_invariant
+        if batch_invariant:
+            from rtp_llm.models_py.modules.qwen4_exp.batch_invariant_projection import (
+                BatchInvariantProjection,
+            )
 
-        self.qk_projection = make_projection(qk_proj, projection_scale)
+            self.qk_projection = BatchInvariantProjection(qk_proj, projection_scale)
+        else:
+            from rtp_llm.models_py.modules.base.common.fp8_linear import make_projection
+
+            self.qk_projection = make_projection(qk_proj, projection_scale)
         self.q_norm_gamma = q_norm_gamma
         self.k_norm_gamma = k_norm_gamma
         self.n_heads = n_heads
@@ -510,7 +519,9 @@ class Qwen4ExpQSAIndexer(nn.Module):
     def project(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """``hidden -> (q [B,S,H,D], raw_keys [B,S,D])``, q normed but unrotated."""
         q, token_k = self.project_raw(hidden_states)
-        q = exact_head_rms_norm(q, self.q_norm_gamma, self.norm_eps)
+        q = exact_head_rms_norm(
+            q, self.q_norm_gamma, self.norm_eps, batch_invariant=self.batch_invariant
+        )
         return q, token_k
 
     def project_raw(self, hidden_states: torch.Tensor):

@@ -28,6 +28,8 @@ from rtp_llm.utils.model_weight import W
 
 
 class Qwen3NextMTPModel(GptModelBase):
+    supports_batch_invariant = True
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -49,13 +51,16 @@ class Qwen3NextMTPModel(GptModelBase):
         self.embed_tokens = Embedding(
             model_config, parallelism_config, weights.get_global_weight(W.embedding)
         )
+        norm_options = {"batch_invariant": True} if self.batch_invariant else {}
         self.pre_fc_norm_embedding = RMSNorm(
             weights.global_weights[W.multi_tokens_predict_enorm],
             eps=model_config.layernorm_eps,
+            **norm_options,
         )
         self.pre_fc_norm_hidden = RMSNorm(
             weights.global_weights[W.multi_tokens_predict_hnorm],
             eps=model_config.layernorm_eps,
+            **norm_options,
         )
         self.fc = LinearFactory.create_linear_from_weights(
             weights.global_weights,
@@ -84,7 +89,9 @@ class Qwen3NextMTPModel(GptModelBase):
             ]
         )
         self.norm = RMSResNorm(
-            weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
+            weights.get_global_weight(W.final_ln_gamma),
+            eps=model_config.layernorm_eps,
+            **norm_options,
         )
 
     def _get_fmha_group_tags(self) -> Optional[list[str]]:

@@ -124,6 +124,7 @@ class V4Args:
     # the default reflects that; the BF16 path remains supported for
     # debugging by callers that pass ``fp8_kv_cache=False`` explicitly.
     fp8_kv_cache: bool = True
+    hw_kernel_config: Optional[object] = None
 
 
 def _block_kwargs(
@@ -195,7 +196,12 @@ def _build_block(
     commit_only: bool = False,
 ) -> Block:
     return Block(
-        **_block_kwargs(layer_id, args, layer_weights, commit_only=commit_only)
+        **_block_kwargs(layer_id, args, layer_weights, commit_only=commit_only),
+        **(
+            {"hw_kernel_config": args.hw_kernel_config}
+            if getattr(args.hw_kernel_config, "batch_invariant", False)
+            else {}
+        ),
     )
 
 
@@ -231,7 +237,11 @@ class V4Transformer(nn.Module):
             mega_request = _optional_env_bool("DSV4_MEGA")
             # SWA-only MTP/DSpark drafts share the process switch, but have no
             # Mega sublayers to initialize or require from the runtime.
-            if mega_request is not False and any(args.compress_ratios[: args.n_layers]):
+            if (
+                not getattr(args.hw_kernel_config, "batch_invariant", False)
+                and mega_request is not False
+                and any(args.compress_ratios[: args.n_layers])
+            ):
                 from rtp_llm.models_py.modules.dsv4.fp8.decode.mega_support import (
                     mega_decode_unavailable_reason,
                 )
@@ -292,7 +302,15 @@ class V4Transformer(nn.Module):
             # ``nn.Parameter``); the framework dict supplies the real tensor.
             assert embedding_weight is not None
             self.embed = EmbeddingTorch(embedding_weight)
-            self.norm = RMSNorm(gw[W.final_ln_gamma], args.norm_eps)
+            self.norm = RMSNorm(
+                gw[W.final_ln_gamma],
+                args.norm_eps,
+                **(
+                    {"batch_invariant": True}
+                    if getattr(args.hw_kernel_config, "batch_invariant", False)
+                    else {}
+                ),
+            )
             if self._mega_decode_enabled:
                 from rtp_llm.models_py.modules.dsv4.fp8.decode.mega_csa_runtime import (
                     MegaCSARuntime,

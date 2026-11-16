@@ -37,7 +37,8 @@ public:
                            const ProfilingDebugLoggingConfig& profiling_debug_logging_config,
                            const CacheConfig&                 cache_config,
                            const SpeculativeExecutionConfig&  sp_config,
-                           bool                               warm_up);
+                           bool                               warm_up,
+                           bool                               batch_invariant = false);
 
     absl::StatusOr<PPExecutionPlan> gatherExecutionPlan(const StreamGroups&                     stream_groups,
                                                         const std::vector<RequestId>&           finished_request_ids,
@@ -143,6 +144,8 @@ private:
                              const SamplerOutput&   sampler_output,
                              PPExecutionResult&     result) const;
 
+    int64_t validVocabSize(int64_t logits_width) const;
+
     void dispatchPrefillOnlyExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
 
     void dispatchSpeculativeExecutionResult(const StreamGroups& stream_groups, const PPExecutionResult& result) const;
@@ -156,6 +159,7 @@ private:
                                     int64_t                  stream_batch_size) const;
 
 private:
+    const bool                     batch_invariant_;
     const bool                     sp_enabled_;
     const bool                     is_dspark_;
     const int64_t                  propose_step_;

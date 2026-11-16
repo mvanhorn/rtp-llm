@@ -11,6 +11,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
+from transformers.utils.generic import is_flash_attention_requested
 
 from rtp_llm.utils.flash_attn_utils import can_use_flash_attn
 
@@ -292,8 +293,8 @@ class Qwen3_5MoeVisionAttention(nn.Module):
             self.config._attn_implementation, eager_attention_forward
         )
 
-        if self.config._attn_implementation == "flash_attention_2":
-            # Flash Attention: Use cu_seqlens for variable length attention
+        if self.config._attn_implementation and is_flash_attention_requested(self.config):
+            # Packed attention uses cu_seqlens for the frame boundaries.
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
             attn_output, _ = attention_interface(
                 self,

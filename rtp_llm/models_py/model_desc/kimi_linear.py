@@ -161,6 +161,52 @@ class KimiLinearKDABase(nn.Module):
         ssm_states = self.linear_cache_converter.get_ssm_state_tensor(kv_cache_tensor)
         return ssm_states
 
+    def forward_batch_invariant(
+        self, qkv, forget_gate, beta, inputs, kv_cache
+    ) -> torch.Tensor:
+        from rtp_llm.models_py.modules.factory.attention import common
+        from rtp_llm.models_py.triton_kernels.fla.batch_invariant_gdn import (
+            batch_invariant_gated_delta_rule,
+        )
+
+        cache = kv_cache.kv_cache_base if kv_cache is not None else None
+        output = batch_invariant_gated_delta_rule(
+            qkv,
+            self.conv_weights,
+            forget_gate.contiguous(),
+            beta.float().sigmoid().contiguous(),
+            cu_seqlens=(
+                inputs.cu_seqlens_device
+                if inputs.is_prefill
+                else inputs.decode_cu_seqlens_device
+            ),
+            lengths=(
+                inputs.prefix_lengths_device
+                if inputs.is_prefill
+                else inputs.sequence_lengths_plus_1_device
+            ),
+            block_map=(
+                inputs.kv_cache_kernel_block_id_device if cache is not None else None
+            ),
+            conv_state=self._get_conv_states(cache) if cache is not None else None,
+            ssm_state=self._get_ssm_states(cache) if cache is not None else None,
+            conv_dtype=self.conv_state_dtype,
+            ssm_dtype=self.ssm_state_dtype,
+            seq_size_per_block=kv_cache.seq_size_per_block if cache is not None else 1,
+            key_heads=self.local_num_k_heads,
+            value_heads=self.local_num_v_heads,
+            key_dim=self.head_k_dim,
+            value_dim=self.head_v_dim,
+            is_decode=not inputs.is_prefill,
+            decay_log=self.alog,
+            decay_bias=self.dt_bias,
+        )
+        if inputs.is_prefill:
+            common.apply_write_cache_store(
+                common.create_write_cache_store_impl(inputs), inputs, kv_cache
+            )
+        return output
+
 
 class KimiLinearKDAPrefill(KimiLinearKDABase):
     def __init__(
@@ -524,6 +570,7 @@ class KimiLinearKDA(nn.Module):
         super().__init__()
         self.linear_attn_config = linear_attn_config
         self.parallelism_config = parallelism_config
+        self.batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
 
         # Projections
         self.in_proj_qkv = LinearFactory.create_linear_from_weights(
@@ -615,7 +662,8 @@ class KimiLinearKDA(nn.Module):
     ) -> torch.Tensor:
         assert attention_inputs is not None, "attention_inputs is required"
         assert (
-            attention_inputs.is_target_verify
+            self.batch_invariant
+            or attention_inputs.is_target_verify
             or not attention_inputs.is_prefill
             or attn_meta.get_prefill_conv1d_meta() is not None
         ), "prefill_conv1d_meta is required for prefill"
@@ -627,7 +675,11 @@ class KimiLinearKDA(nn.Module):
         g_proj = self.g_b_proj(self.g_a_proj(hidden_states))  # [token, H*D]
 
         # 2. Prefill or decode
-        if attention_inputs.is_prefill and not attn_meta.is_target_verify:
+        if self.batch_invariant:
+            attn_output = self.prefill_kda.forward_batch_invariant(
+                projected_qkv, forget_gate, beta_input, attention_inputs, kv_cache
+            )
+        elif attention_inputs.is_prefill and not attn_meta.is_target_verify:
             attn_output = self.prefill_kda(
                 projected_qkv,
                 forget_gate,
@@ -659,7 +711,9 @@ class KimiLinearKDA(nn.Module):
         attn_output = self.out_proj(attn_output)
 
         if self.parallelism_config.get_attn_tp_size() > 1:
-            attn_output = all_reduce(attn_output, group=Group.TP)
+            attn_output = all_reduce(
+                attn_output, group=Group.TP, batch_invariant=self.batch_invariant
+            )
 
         return attn_output
 
@@ -732,11 +786,16 @@ class KimiLinearDecoderLayer(nn.Module):
             )
 
         # RMSResNorm: fused residual add + layernorm
+        batch_invariant = getattr(hw_kernel_config, "batch_invariant", False)
         self.input_layernorm = RMSResNorm(
-            weights[W.pre_ln_gamma], eps=config.layernorm_eps
+            weights[W.pre_ln_gamma],
+            eps=config.layernorm_eps,
+            batch_invariant=batch_invariant,
         )
         self.post_attention_layernorm = RMSResNorm(
-            weights[W.post_ln_gamma], eps=config.layernorm_eps
+            weights[W.post_ln_gamma],
+            eps=config.layernorm_eps,
+            batch_invariant=batch_invariant,
         )
 
     def forward(
@@ -777,6 +836,8 @@ class KimiLinearDecoderLayer(nn.Module):
 
 
 class KimiLinearModel(GptModelBase):
+    supports_batch_invariant = True
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -819,7 +880,9 @@ class KimiLinearModel(GptModelBase):
             ]
         )
         self.norm = RMSResNorm(
-            weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
+            weights.get_global_weight(W.final_ln_gamma),
+            eps=model_config.layernorm_eps,
+            batch_invariant=self.batch_invariant,
         )
         self._init_capture_context(
             self._capture_canonical_layer,
@@ -858,7 +921,11 @@ class KimiLinearModel(GptModelBase):
         attention_inputs = get_primary_attention_inputs(inputs, self.kv_cache)
         prefill_conv1d_meta = None
         is_target_verify = attention_inputs.is_target_verify
-        if attention_inputs.is_prefill and not is_target_verify:
+        if (
+            attention_inputs.is_prefill
+            and not is_target_verify
+            and not self.batch_invariant
+        ):
             cu_seqlen_without_padding = attention_inputs.cu_seqlens_device
             prefill_conv1d_meta = prepare_causal_conv1d_metadata(
                 query_start_loc=cu_seqlen_without_padding,

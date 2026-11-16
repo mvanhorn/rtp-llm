@@ -62,6 +62,7 @@ class LoadConfig(BaseModel):
 
     phy2log: Optional[List[List[int]]] = None
     use_swizzleA: bool = False
+    batch_invariant: bool = False
     force_cpu_load_weights: bool = False
     moe_pure_tp_preshard: bool = False
 

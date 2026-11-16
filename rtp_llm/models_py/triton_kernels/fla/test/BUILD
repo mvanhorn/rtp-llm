@@ -79,6 +79,19 @@ py_test(
 )
 
 py_test(
+    name = "test_batch_invariant_gdn",
+    srcs = ["test_batch_invariant_gdn.py"],
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:fla",
+        ":packaging",
+        ":torch",
+        ":triton",
+    ],
+    exec_properties = {"gpu": "L20_CU13"},
+    tags = ["L20_CU13"],
+)
+
+py_test(
     name = "test_gdn_block_prefill_rocm",
     srcs = ["test_gdn_block_prefill.py"],
     main = "test_gdn_block_prefill.py",

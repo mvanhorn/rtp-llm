@@ -96,9 +96,10 @@ public:
             json.Jsonize("cum_log_probs", cum_log_probs_vec);
         }
         if (json.GetMode() == FastJsonizableBase::Mode::TO_JSON && raw_logprobs.has_value()) {
-            auto               tensor = raw_logprobs.value().contiguous();
-            const auto*        data   = tensor.data_ptr<float>();
-            std::vector<float> scores(data, data + tensor.numel());
+            auto        tensor = raw_logprobs.value().contiguous();
+            const auto* data   = tensor.data_ptr<float>();
+            // The JSON writer's float precision is too short for an FP32 round trip.
+            std::vector<double> scores(data, data + tensor.numel());
             json.Jsonize("raw_logprobs", scores);
         }
         json.Jsonize("local_reuse_len", local_reuse_len, local_reuse_len);

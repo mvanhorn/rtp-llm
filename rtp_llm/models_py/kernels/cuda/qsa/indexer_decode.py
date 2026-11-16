@@ -1,7 +1,87 @@
 """Device kernels; model state and execution policy belong to the caller."""
 
+import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _compress_key(
+    history,
+    cosine,
+    sine,
+    gamma,
+    D: tl.constexpr,
+    ROTARY: tl.constexpr,
+    RATIO: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    d = tl.arange(0, D)
+    pooled = (tl.sum(history, axis=0) * (1.0 / RATIO)).to(tl.bfloat16).to(tl.float32)
+    gain = 1.0 + gamma.to(tl.float32)
+    rms = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / D + EPS)
+    normalized = (pooled * rms * gain).to(tl.bfloat16)
+
+    # Upstream RoPE rounds each multiplication and the addition to BF16.
+    partner = tl.where(
+        d < ROTARY, tl.where(d < ROTARY // 2, d + ROTARY // 2, d - ROTARY // 2), d
+    )
+    rotated_half = tl.gather(normalized, partner, axis=0)
+    left = (normalized.to(tl.float32) * cosine.to(tl.float32)).to(tl.bfloat16)
+    right = (
+        rotated_half.to(tl.float32)
+        * sine.to(tl.float32)
+        * tl.where(d < ROTARY // 2, -1.0, 1.0)
+    ).to(tl.bfloat16)
+    return tl.where(
+        d < ROTARY,
+        (left.to(tl.float32) + right.to(tl.float32)).to(tl.bfloat16),
+        normalized,
+    )
+
+
+@triton.jit
+def _compress_prefill_keys(
+    raw,
+    cos,
+    sin,
+    gamma,
+    out,
+    D: tl.constexpr,
+    ROTARY: tl.constexpr,
+    RATIO: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_RATIO: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, D)
+    group = tl.arange(0, BLOCK_RATIO)
+    offsets = (row * RATIO + group[:, None]) * D + d[None, :]
+    history = tl.load(raw + offsets, mask=group[:, None] < RATIO, other=0)
+    c = tl.load(cos + row * ROTARY + d, mask=d < ROTARY, other=1)
+    s = tl.load(sin + row * ROTARY + d, mask=d < ROTARY, other=0)
+    value = _compress_key(history, c, s, tl.load(gamma + d), D, ROTARY, RATIO, EPS)
+    tl.store(out + row * D + d, value)
+
+
+def compress_prefill_keys(history, cos, sin, gamma, eps):
+    """Apply the same compression and BF16 boundaries as the decode writer."""
+    rows, ratio, width = history.shape
+    out = torch.empty((rows, width), device=history.device, dtype=torch.bfloat16)
+    _compress_prefill_keys[(rows,)](
+        history.contiguous(),
+        cos.contiguous(),
+        sin.contiguous(),
+        gamma.contiguous(),
+        out,
+        width,
+        cos.shape[-1],
+        ratio,
+        eps,
+        triton.next_power_of_2(ratio),
+        num_warps=4,
+    )
+    return out
 
 
 @triton.jit
@@ -65,31 +145,10 @@ def _write_decode_key(
         # The current key has just been written by this program. Read the
         # input directly so no global-memory fence is needed for that row.
         history = tl.where(group[:, None] == 3, raw[None, :], history)
-        pooled = (tl.sum(history, axis=0) * 0.25).to(tl.bfloat16).to(tl.float32)
-        gain = 1.0 + tl.load(gamma_ptr + d).to(tl.float32)
-        rms = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / D + EPS)
-        normalized = (pooled * rms * gain).to(tl.bfloat16)
-
-        # Upstream applies RoPE to BF16 values: each multiplication and the
-        # final addition rounds to BF16. Preserve that boundary here.
-        partner = tl.where(
-            d < ROTARY,
-            tl.where(d < ROTARY // 2, d + ROTARY // 2, d - ROTARY // 2),
-            d,
-        )
-        rotated_half = tl.gather(normalized, partner, axis=0)
         cosine = tl.load(cos_ptr + request * ROTARY + d, mask=d < ROTARY, other=1)
         sine = tl.load(sin_ptr + request * ROTARY + d, mask=d < ROTARY, other=0)
-        left = (normalized.to(tl.float32) * cosine.to(tl.float32)).to(tl.bfloat16)
-        right = (
-            rotated_half.to(tl.float32)
-            * sine.to(tl.float32)
-            * tl.where(d < ROTARY // 2, -1.0, 1.0)
-        ).to(tl.bfloat16)
-        value = tl.where(
-            d < ROTARY,
-            (left.to(tl.float32) + right.to(tl.float32)).to(tl.bfloat16),
-            normalized,
+        value = _compress_key(
+            history, cosine, sine, tl.load(gamma_ptr + d), D, ROTARY, 4, EPS
         )
 
         kv_column = position // KV_TOKENS_PER_BLOCK
